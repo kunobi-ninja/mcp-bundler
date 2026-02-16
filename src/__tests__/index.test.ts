@@ -17,13 +17,13 @@ describe('formatError', () => {
   });
 });
 
-describe('McpBundler', () => {
+describe('McpBundler (http)', () => {
   let bundler: McpBundler;
 
   beforeEach(() => {
     bundler = new McpBundler({
       name: 'test',
-      url: 'http://127.0.0.1:9999/mcp',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
       reconnect: { enabled: false },
       logger: () => {},
     });
@@ -93,7 +93,7 @@ describe('McpBundler', () => {
     it('stays disconnected after failed connect with reconnect enabled', async () => {
       const reconnectBundler = new McpBundler({
         name: 'reconnect-test',
-        url: 'http://127.0.0.1:9999/mcp',
+        transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
         reconnect: { enabled: true, intervalMs: 100, maxRetries: 2 },
         logger: () => {},
       });
@@ -118,7 +118,7 @@ describe('McpBundler', () => {
     it('close cancels pending reconnect', async () => {
       const reconnectBundler = new McpBundler({
         name: 'reconnect-test',
-        url: 'http://127.0.0.1:9999/mcp',
+        transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
         reconnect: { enabled: true, intervalMs: 50, maxRetries: 5 },
         logger: () => {},
       });
@@ -177,7 +177,7 @@ describe('McpBundler', () => {
     it('uses default reconnect options', () => {
       const defaultBundler = new McpBundler({
         name: 'defaults',
-        url: 'http://127.0.0.1:9999/mcp',
+        transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
       });
       expect(defaultBundler.getState()).toBe('idle');
     });
@@ -185,12 +185,125 @@ describe('McpBundler', () => {
     it('uses default logger without throwing', async () => {
       const defaultBundler = new McpBundler({
         name: 'defaults',
-        url: 'http://127.0.0.1:9999/mcp',
+        transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
         reconnect: { enabled: false },
       });
       await defaultBundler.connect();
       expect(defaultBundler.getState()).toBe('disconnected');
       await defaultBundler.close();
     });
+  });
+});
+
+describe('McpBundler (stdio)', () => {
+  it('accepts stdio transport config', () => {
+    const bundler = new McpBundler({
+      name: 'stdio-test',
+      transport: {
+        type: 'stdio',
+        command: 'echo',
+        args: ['hello'],
+        env: { FOO: 'bar' },
+      },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+    expect(bundler.getState()).toBe('idle');
+    expect(bundler.name).toBe('stdio-test');
+  });
+
+  it('does not schedule reconnect for stdio transport', async () => {
+    const logMessages: string[] = [];
+    const bundler = new McpBundler({
+      name: 'stdio-no-reconnect',
+      transport: { type: 'stdio', command: 'false' },
+      reconnect: { enabled: true, intervalMs: 10, maxRetries: 5 },
+      logger: (_level, msg) => logMessages.push(msg),
+    });
+
+    await bundler.connect();
+    expect(bundler.getState()).toBe('disconnected');
+
+    // Wait past the reconnect interval — no reconnect should be scheduled for stdio
+    await new Promise((r) => setTimeout(r, 50));
+    expect(bundler.getState()).toBe('disconnected');
+
+    // Verify no "Reconnecting" log was emitted
+    expect(logMessages.some((m) => m.includes('Reconnecting'))).toBe(false);
+
+    await bundler.close();
+  });
+});
+
+describe('registerTools with prefix', () => {
+  it('stores prefixed names in registeredToolNames', () => {
+    const bundler = new McpBundler({
+      name: 'prefix-test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+
+    // Simulate what registerTools does with prefixed names
+    const bundlerAny = bundler as unknown as {
+      registeredToolNames: Set<string>;
+    };
+
+    // Manually add prefixed names as registerTools would
+    bundlerAny.registeredToolNames.add('ga_get_report');
+    bundlerAny.registeredToolNames.add('ga_list_properties');
+
+    // Verify unregisterTools uses prefixed names
+    const removeFn1 = vi.fn();
+    const removeFn2 = vi.fn();
+    const fakeServer = {
+      _registeredTools: {
+        ga_get_report: { remove: removeFn1 },
+        ga_list_properties: { remove: removeFn2 },
+        other_tool: { remove: vi.fn() },
+      },
+    } as unknown as Parameters<typeof bundler.unregisterTools>[0];
+
+    bundler.unregisterTools(fakeServer);
+    expect(removeFn1).toHaveBeenCalledOnce();
+    expect(removeFn2).toHaveBeenCalledOnce();
+  });
+});
+
+describe('registerResources / registerPrompts', () => {
+  it('registerResources returns early when not connected', async () => {
+    const bundler = new McpBundler({
+      name: 'resources-test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+
+    // Should not throw — just returns early since client is null
+    await expect(
+      bundler.registerResources(
+        {} as Parameters<typeof bundler.registerResources>[0],
+      ),
+    ).resolves.toBeUndefined();
+
+    await bundler.close();
+  });
+
+  it('registerPrompts returns early when not connected', async () => {
+    const bundler = new McpBundler({
+      name: 'prompts-test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+
+    // Should not throw — just returns early since client is null
+    await expect(
+      bundler.registerPrompts(
+        {} as Parameters<typeof bundler.registerPrompts>[0],
+      ),
+    ).resolves.toBeUndefined();
+
+    await bundler.close();
   });
 });

@@ -1,8 +1,14 @@
 import { EventEmitter } from 'node:events';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
+import type {
+  CallToolResult,
+  Prompt,
+  Resource,
+  Tool,
+} from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 
 export type ConnectionState =
@@ -17,9 +23,18 @@ export interface ReconnectOptions {
   maxRetries: number;
 }
 
+export type McpTransportConfig =
+  | { type: 'http'; url: string }
+  | {
+      type: 'stdio';
+      command: string;
+      args?: string[];
+      env?: Record<string, string>;
+    };
+
 export interface McpBundlerOptions {
   name: string;
-  url: string;
+  transport: McpTransportConfig;
   reconnect?: Partial<ReconnectOptions>;
   logger?: (level: string, message: string, data?: unknown) => void;
 }
@@ -66,8 +81,11 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   public readonly name: string;
 
   private client: Client | null = null;
-  private transport: StreamableHTTPClientTransport | null = null;
-  private readonly url: string;
+  private activeTransport:
+    | StreamableHTTPClientTransport
+    | StdioClientTransport
+    | null = null;
+  private readonly transportConfig: McpTransportConfig;
   private readonly reconnectOpts: ReconnectOptions;
   private readonly logger: (
     level: string,
@@ -85,7 +103,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   constructor(options: McpBundlerOptions) {
     super();
     this.name = options.name;
-    this.url = options.url;
+    this.transportConfig = options.transport;
     this.logger = options.logger ?? (() => {});
     this.reconnectOpts = {
       enabled: options.reconnect?.enabled ?? true,
@@ -107,7 +125,11 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     if (this.state === 'connecting' || this.state === 'connected') return;
 
     this.state = 'connecting';
-    this.logger('info', `[${this.name}] Connecting to ${this.url}`);
+    const target =
+      this.transportConfig.type === 'http'
+        ? this.transportConfig.url
+        : `${this.transportConfig.command} ${(this.transportConfig.args ?? []).join(' ')}`;
+    this.logger('info', `[${this.name}] Connecting to ${target}`);
 
     try {
       this.client = new Client(
@@ -115,21 +137,46 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
         { capabilities: {} },
       );
 
-      this.transport = new StreamableHTTPClientTransport(new URL(this.url));
-
-      this.transport.onclose = () => {
-        if (this.state === 'connected') {
-          this.handleDisconnect();
-        }
-      };
-
-      this.transport.onerror = (error) => {
-        this.logger('error', `[${this.name}] Transport error`, {
-          error: formatError(error),
+      if (this.transportConfig.type === 'http') {
+        const httpTransport = new StreamableHTTPClientTransport(
+          new URL(this.transportConfig.url),
+        );
+        httpTransport.onclose = () => {
+          if (this.state === 'connected') {
+            this.handleDisconnect();
+          }
+        };
+        httpTransport.onerror = (error) => {
+          this.logger('error', `[${this.name}] Transport error`, {
+            error: formatError(error),
+          });
+        };
+        this.activeTransport = httpTransport;
+      } else {
+        const stdioTransport = new StdioClientTransport({
+          command: this.transportConfig.command,
+          args: this.transportConfig.args,
+          env: this.transportConfig.env
+            ? ({
+                ...process.env,
+                ...this.transportConfig.env,
+              } as Record<string, string>)
+            : undefined,
         });
-      };
+        stdioTransport.onerror = (error) => {
+          this.logger('error', `[${this.name}] Transport error`, {
+            error: formatError(error),
+          });
+        };
+        stdioTransport.onclose = () => {
+          if (this.state === 'connected') {
+            this.handleDisconnect();
+          }
+        };
+        this.activeTransport = stdioTransport;
+      }
 
-      await this.client.connect(this.transport);
+      await this.client.connect(this.activeTransport);
 
       this.state = 'connected';
       this.retryCount = 0;
@@ -161,28 +208,33 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     }
   }
 
-  async registerTools(server: McpServer): Promise<void> {
+  async registerTools(server: McpServer, prefix = ''): Promise<void> {
     const tools = await this.listTools();
 
     for (const tool of tools) {
-      this.logger('info', `[${this.name}] Bundling tool: ${tool.name}`);
+      const registeredName = prefix + tool.name;
+      this.logger('info', `[${this.name}] Bundling tool: ${registeredName}`);
 
       const inputSchema = zodShapeFromJsonSchema(tool.inputSchema);
+      const originalName = tool.name;
 
       server.registerTool(
-        tool.name,
+        registeredName,
         {
           description: tool.description,
           inputSchema,
         },
         async (args) => {
-          this.logger('info', `[${this.name}] Forwarding call: ${tool.name}`);
+          this.logger(
+            'info',
+            `[${this.name}] Forwarding call: ${registeredName} → ${originalName}`,
+          );
           if (!this.client || this.state !== 'connected') {
             return {
               content: [
                 {
                   type: 'text' as const,
-                  text: `[${this.name}] Not connected — cannot call ${tool.name}`,
+                  text: `[${this.name}] Not connected — cannot call ${originalName}`,
                 },
               ],
               isError: true,
@@ -190,7 +242,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
           }
           try {
             const result = await this.client.callTool({
-              name: tool.name,
+              name: originalName,
               arguments: args as Record<string, unknown>,
             });
             return result as CallToolResult;
@@ -198,14 +250,14 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
             const msg = formatError(error);
             this.logger(
               'error',
-              `[${this.name}] Tool call failed: ${tool.name}`,
+              `[${this.name}] Tool call failed: ${originalName}`,
               { error: msg },
             );
             return {
               content: [
                 {
                   type: 'text' as const,
-                  text: `[${this.name}] ${tool.name} failed: ${msg}`,
+                  text: `[${this.name}] ${originalName} failed: ${msg}`,
                 },
               ],
               isError: true,
@@ -214,7 +266,166 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
         },
       );
 
-      this.registeredToolNames.add(tool.name);
+      this.registeredToolNames.add(registeredName);
+    }
+  }
+
+  async registerResources(server: McpServer): Promise<void> {
+    if (!this.client || this.state !== 'connected') return;
+
+    const capabilities = this.client.getServerCapabilities();
+    if (!capabilities?.resources) {
+      this.logger(
+        'debug',
+        `[${this.name}] Server does not support resources, skipping`,
+      );
+      return;
+    }
+
+    let resources: Resource[];
+    try {
+      const result = await this.client.listResources();
+      resources = result.resources;
+    } catch (error) {
+      this.logger('error', `[${this.name}] Failed to list resources`, {
+        error: formatError(error),
+      });
+      return;
+    }
+
+    for (const resource of resources) {
+      this.logger('info', `[${this.name}] Bundling resource: ${resource.uri}`);
+
+      server.registerResource(
+        resource.name,
+        resource.uri,
+        { description: resource.description, mimeType: resource.mimeType },
+        async (uri) => {
+          if (!this.client || this.state !== 'connected') {
+            return {
+              contents: [
+                {
+                  uri: uri.href,
+                  text: `[${this.name}] Not connected — cannot read ${resource.uri}`,
+                },
+              ],
+            };
+          }
+          try {
+            const result = await this.client.readResource({
+              uri: resource.uri,
+            });
+            return result;
+          } catch (error) {
+            const msg = formatError(error);
+            this.logger(
+              'error',
+              `[${this.name}] Resource read failed: ${resource.uri}`,
+              { error: msg },
+            );
+            return {
+              contents: [
+                {
+                  uri: uri.href,
+                  text: `[${this.name}] ${resource.uri} read failed: ${msg}`,
+                },
+              ],
+            };
+          }
+        },
+      );
+    }
+  }
+
+  async registerPrompts(server: McpServer, prefix = ''): Promise<void> {
+    if (!this.client || this.state !== 'connected') return;
+
+    const capabilities = this.client.getServerCapabilities();
+    if (!capabilities?.prompts) {
+      this.logger(
+        'debug',
+        `[${this.name}] Server does not support prompts, skipping`,
+      );
+      return;
+    }
+
+    let prompts: Prompt[];
+    try {
+      const result = await this.client.listPrompts();
+      prompts = result.prompts;
+    } catch (error) {
+      this.logger('error', `[${this.name}] Failed to list prompts`, {
+        error: formatError(error),
+      });
+      return;
+    }
+
+    for (const prompt of prompts) {
+      const registeredName = prefix + prompt.name;
+      this.logger('info', `[${this.name}] Bundling prompt: ${registeredName}`);
+
+      // Build Zod raw shape from prompt arguments
+      const argShape: Record<string, z.ZodTypeAny> = {};
+      for (const arg of prompt.arguments ?? []) {
+        let field: z.ZodTypeAny = z.string();
+        if (arg.description) {
+          field = field.describe(arg.description);
+        }
+        if (!arg.required) {
+          field = field.optional();
+        }
+        argShape[arg.name] = field;
+      }
+
+      const originalName = prompt.name;
+
+      server.registerPrompt(
+        registeredName,
+        {
+          description: prompt.description,
+          argsSchema: Object.keys(argShape).length > 0 ? argShape : undefined,
+        },
+        async (args) => {
+          if (!this.client || this.state !== 'connected') {
+            return {
+              messages: [
+                {
+                  role: 'user' as const,
+                  content: {
+                    type: 'text' as const,
+                    text: `[${this.name}] Not connected — cannot get prompt ${originalName}`,
+                  },
+                },
+              ],
+            };
+          }
+          try {
+            const result = await this.client.getPrompt({
+              name: originalName,
+              arguments: args as Record<string, string>,
+            });
+            return result;
+          } catch (error) {
+            const msg = formatError(error);
+            this.logger(
+              'error',
+              `[${this.name}] Prompt call failed: ${originalName}`,
+              { error: msg },
+            );
+            return {
+              messages: [
+                {
+                  role: 'user' as const,
+                  content: {
+                    type: 'text' as const,
+                    text: `[${this.name}] ${originalName} failed: ${msg}`,
+                  },
+                },
+              ],
+            };
+          }
+        },
+      );
     }
   }
 
@@ -250,7 +461,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       }
       this.client = null;
     }
-    this.transport = null;
+    this.activeTransport = null;
     this.state = 'idle';
   }
 
@@ -265,6 +476,8 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   private scheduleReconnect(): void {
     if (this.closed) return;
     if (!this.reconnectOpts.enabled) return;
+    // Skip reconnect for stdio — process lifecycle is managed by the transport
+    if (this.transportConfig.type === 'stdio') return;
     if (this.retryCount >= this.reconnectOpts.maxRetries) {
       this.logger(
         'warn',
@@ -291,7 +504,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
           // ignore close errors on stale client
         }
         this.client = null;
-        this.transport = null;
+        this.activeTransport = null;
       }
 
       await this.connect();
