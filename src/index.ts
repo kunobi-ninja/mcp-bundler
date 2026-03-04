@@ -24,7 +24,7 @@ export interface ReconnectOptions {
 }
 
 export type McpTransportConfig =
-  | { type: 'http'; url: string }
+  | { type: 'http'; url: string; headers?: Record<string, string> }
   | {
       type: 'stdio';
       command: string;
@@ -185,6 +185,9 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       if (this.transportConfig.type === 'http') {
         const httpTransport = new StreamableHTTPClientTransport(
           new URL(this.transportConfig.url),
+          this.transportConfig.headers
+            ? { requestInit: { headers: this.transportConfig.headers } }
+            : undefined,
         );
         httpTransport.onclose = () => {
           if (this.state === 'connected') {
