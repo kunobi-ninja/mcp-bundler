@@ -307,3 +307,143 @@ describe('registerResources / registerPrompts', () => {
     await bundler.close();
   });
 });
+
+describe('unregisterResources', () => {
+  it('handles server without _registeredResources gracefully', () => {
+    const bundler = new McpBundler({
+      name: 'test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+    const fakeServer = {} as Parameters<typeof bundler.unregisterResources>[0];
+    expect(() => bundler.unregisterResources(fakeServer)).not.toThrow();
+  });
+
+  it('calls remove() on registered resources', () => {
+    const bundler = new McpBundler({
+      name: 'test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+
+    const removeFn = vi.fn();
+    const resources: Record<string, { remove: () => void }> = {
+      'test://a': { remove: removeFn },
+      'test://b': { remove: vi.fn() },
+    };
+
+    const bundlerAny = bundler as unknown as {
+      registeredResourceUris: Set<string>;
+    };
+    bundlerAny.registeredResourceUris.add('test://a');
+
+    const fakeServer = {
+      _registeredResources: resources,
+    } as unknown as Parameters<typeof bundler.unregisterResources>[0];
+    bundler.unregisterResources(fakeServer);
+
+    expect(removeFn).toHaveBeenCalledOnce();
+    expect(resources['test://b'].remove).not.toHaveBeenCalled();
+  });
+
+  it('clears registeredResourceUris after unregister', () => {
+    const bundler = new McpBundler({
+      name: 'test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+
+    const bundlerAny = bundler as unknown as {
+      registeredResourceUris: Set<string>;
+    };
+    bundlerAny.registeredResourceUris.add('test://a');
+
+    const fakeServer = {
+      _registeredResources: { 'test://a': { remove: vi.fn() } },
+    } as unknown as Parameters<typeof bundler.unregisterResources>[0];
+    bundler.unregisterResources(fakeServer);
+
+    expect(bundlerAny.registeredResourceUris.size).toBe(0);
+  });
+});
+
+describe('unregisterPrompts', () => {
+  it('handles server without _registeredPrompts gracefully', () => {
+    const bundler = new McpBundler({
+      name: 'test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+    const fakeServer = {} as Parameters<typeof bundler.unregisterPrompts>[0];
+    expect(() => bundler.unregisterPrompts(fakeServer)).not.toThrow();
+  });
+
+  it('calls remove() on registered prompts', () => {
+    const bundler = new McpBundler({
+      name: 'test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+
+    const removeFn = vi.fn();
+    const prompts: Record<string, { remove: () => void }> = {
+      dev__setup: { remove: removeFn },
+      dev__other: { remove: vi.fn() },
+    };
+
+    const bundlerAny = bundler as unknown as {
+      registeredPromptNames: Set<string>;
+    };
+    bundlerAny.registeredPromptNames.add('dev__setup');
+
+    const fakeServer = {
+      _registeredPrompts: prompts,
+    } as unknown as Parameters<typeof bundler.unregisterPrompts>[0];
+    bundler.unregisterPrompts(fakeServer);
+
+    expect(removeFn).toHaveBeenCalledOnce();
+    expect(prompts.dev__other.remove).not.toHaveBeenCalled();
+  });
+});
+
+describe('getResources / getPrompts', () => {
+  it('starts with empty resources and prompts', () => {
+    const bundler = new McpBundler({
+      name: 'test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+    expect(bundler.getResources()).toEqual([]);
+    expect(bundler.getPrompts()).toEqual([]);
+  });
+});
+
+describe('listResources / listPrompts', () => {
+  it('listResources returns empty when not connected', async () => {
+    const bundler = new McpBundler({
+      name: 'test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+    expect(await bundler.listResources()).toEqual([]);
+    await bundler.close();
+  });
+
+  it('listPrompts returns empty when not connected', async () => {
+    const bundler = new McpBundler({
+      name: 'test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+    expect(await bundler.listPrompts()).toEqual([]);
+    await bundler.close();
+  });
+});

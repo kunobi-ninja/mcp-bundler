@@ -43,6 +43,8 @@ export interface McpBundlerEvents {
   connected: [];
   disconnected: [];
   tools_changed: [tools: Tool[]];
+  resources_changed: [resources: Resource[]];
+  prompts_changed: [prompts: Prompt[]];
 }
 
 export function formatError(error: unknown): string {
@@ -97,7 +99,11 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   private retryCount = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private registeredToolNames: Set<string> = new Set();
+  private registeredResourceUris: Set<string> = new Set();
+  private registeredPromptNames: Set<string> = new Set();
   private lastToolNames: string[] = [];
+  private lastResourceUris: string[] = [];
+  private lastPromptNames: string[] = [];
   private closed = false;
 
   constructor(options: McpBundlerOptions) {
@@ -120,6 +126,14 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     return [...this.lastToolNames];
   }
 
+  getResources(): string[] {
+    return [...this.lastResourceUris];
+  }
+
+  getPrompts(): string[] {
+    return [...this.lastPromptNames];
+  }
+
   async connect(): Promise<void> {
     if (this.closed) return;
     if (this.state === 'connecting' || this.state === 'connected') return;
@@ -134,7 +148,38 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     try {
       this.client = new Client(
         { name: `${this.name}-bundler`, version: '1.0.0' },
-        { capabilities: {} },
+        {
+          capabilities: {},
+          listChanged: {
+            tools: {
+              autoRefresh: true,
+              onChanged: (_err, tools) => {
+                if (tools) {
+                  this.lastToolNames = tools.map((t) => t.name);
+                  this.emit('tools_changed', tools);
+                }
+              },
+            },
+            resources: {
+              autoRefresh: true,
+              onChanged: (_err, resources) => {
+                if (resources) {
+                  this.lastResourceUris = resources.map((r) => r.uri);
+                  this.emit('resources_changed', resources);
+                }
+              },
+            },
+            prompts: {
+              autoRefresh: true,
+              onChanged: (_err, prompts) => {
+                if (prompts) {
+                  this.lastPromptNames = prompts.map((p) => p.name);
+                  this.emit('prompts_changed', prompts);
+                }
+              },
+            },
+          },
+        },
       );
 
       if (this.transportConfig.type === 'http') {
@@ -185,6 +230,12 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       const tools = await this.listTools();
       this.lastToolNames = tools.map((t) => t.name);
 
+      const resources = await this.listResources();
+      this.lastResourceUris = resources.map((r) => r.uri);
+
+      const prompts = await this.listPrompts();
+      this.lastPromptNames = prompts.map((p) => p.name);
+
       this.emit('connected');
     } catch (error) {
       this.logger('error', `[${this.name}] Connection failed`, {
@@ -202,6 +253,36 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       return result.tools;
     } catch (error) {
       this.logger('error', `[${this.name}] Failed to list tools`, {
+        error: formatError(error),
+      });
+      return [];
+    }
+  }
+
+  async listResources(): Promise<Resource[]> {
+    if (!this.client || this.state !== 'connected') return [];
+    const capabilities = this.client.getServerCapabilities();
+    if (!capabilities?.resources) return [];
+    try {
+      const result = await this.client.listResources();
+      return result.resources;
+    } catch (error) {
+      this.logger('error', `[${this.name}] Failed to list resources`, {
+        error: formatError(error),
+      });
+      return [];
+    }
+  }
+
+  async listPrompts(): Promise<Prompt[]> {
+    if (!this.client || this.state !== 'connected') return [];
+    const capabilities = this.client.getServerCapabilities();
+    if (!capabilities?.prompts) return [];
+    try {
+      const result = await this.client.listPrompts();
+      return result.prompts;
+    } catch (error) {
+      this.logger('error', `[${this.name}] Failed to list prompts`, {
         error: formatError(error),
       });
       return [];
@@ -271,27 +352,8 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   }
 
   async registerResources(server: McpServer): Promise<void> {
-    if (!this.client || this.state !== 'connected') return;
-
-    const capabilities = this.client.getServerCapabilities();
-    if (!capabilities?.resources) {
-      this.logger(
-        'debug',
-        `[${this.name}] Server does not support resources, skipping`,
-      );
-      return;
-    }
-
-    let resources: Resource[];
-    try {
-      const result = await this.client.listResources();
-      resources = result.resources;
-    } catch (error) {
-      this.logger('error', `[${this.name}] Failed to list resources`, {
-        error: formatError(error),
-      });
-      return;
-    }
+    const resources = await this.listResources();
+    if (resources.length === 0) return;
 
     for (const resource of resources) {
       this.logger('info', `[${this.name}] Bundling resource: ${resource.uri}`);
@@ -334,31 +396,14 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
           }
         },
       );
+
+      this.registeredResourceUris.add(resource.uri);
     }
   }
 
   async registerPrompts(server: McpServer, prefix = ''): Promise<void> {
-    if (!this.client || this.state !== 'connected') return;
-
-    const capabilities = this.client.getServerCapabilities();
-    if (!capabilities?.prompts) {
-      this.logger(
-        'debug',
-        `[${this.name}] Server does not support prompts, skipping`,
-      );
-      return;
-    }
-
-    let prompts: Prompt[];
-    try {
-      const result = await this.client.listPrompts();
-      prompts = result.prompts;
-    } catch (error) {
-      this.logger('error', `[${this.name}] Failed to list prompts`, {
-        error: formatError(error),
-      });
-      return;
-    }
+    const prompts = await this.listPrompts();
+    if (prompts.length === 0) return;
 
     for (const prompt of prompts) {
       const registeredName = prefix + prompt.name;
@@ -426,6 +471,8 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
           }
         },
       );
+
+      this.registeredPromptNames.add(registeredName);
     }
   }
 
@@ -443,6 +490,38 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       }
     }
     this.registeredToolNames.clear();
+  }
+
+  unregisterResources(server: McpServer): void {
+    const serverAny = server as unknown as {
+      _registeredResources: Record<string, { remove?: () => void }>;
+    };
+    if (!serverAny._registeredResources) return;
+
+    for (const uri of this.registeredResourceUris) {
+      const resource = serverAny._registeredResources[uri];
+      if (resource?.remove) {
+        this.logger('info', `[${this.name}] Removing resource: ${uri}`);
+        resource.remove();
+      }
+    }
+    this.registeredResourceUris.clear();
+  }
+
+  unregisterPrompts(server: McpServer): void {
+    const serverAny = server as unknown as {
+      _registeredPrompts: Record<string, { remove?: () => void }>;
+    };
+    if (!serverAny._registeredPrompts) return;
+
+    for (const name of this.registeredPromptNames) {
+      const prompt = serverAny._registeredPrompts[name];
+      if (prompt?.remove) {
+        this.logger('info', `[${this.name}] Removing prompt: ${name}`);
+        prompt.remove();
+      }
+    }
+    this.registeredPromptNames.clear();
   }
 
   async close(): Promise<void> {
@@ -469,6 +548,8 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     this.state = 'disconnected';
     this.logger('info', `[${this.name}] Disconnected`);
     this.lastToolNames = [];
+    this.lastResourceUris = [];
+    this.lastPromptNames = [];
     this.emit('disconnected');
     this.scheduleReconnect();
   }
@@ -508,18 +589,6 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       }
 
       await this.connect();
-
-      // If reconnect succeeded and tools changed, emit tools_changed
-      if ((this.state as ConnectionState) === 'connected') {
-        const tools = await this.listTools();
-        const newNames = tools.map((t) => t.name).sort();
-        const oldNames = [...this.lastToolNames].sort();
-
-        if (JSON.stringify(newNames) !== JSON.stringify(oldNames)) {
-          this.lastToolNames = tools.map((t) => t.name);
-          this.emit('tools_changed', tools);
-        }
-      }
     }, this.reconnectOpts.intervalMs);
   }
 }
