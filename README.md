@@ -21,15 +21,29 @@ const bundler = new McpBundler({
 
 bundler.on('connected', async () => {
   await bundler.registerTools(server);
+  await bundler.registerResources(server);
+  await bundler.registerPrompts(server, 'my-server__');
 });
 
 bundler.on('disconnected', () => {
   bundler.unregisterTools(server);
+  bundler.unregisterResources(server);
+  bundler.unregisterPrompts(server);
 });
 
 bundler.on('tools_changed', async () => {
   bundler.unregisterTools(server);
   await bundler.registerTools(server);
+});
+
+bundler.on('resources_changed', async () => {
+  bundler.unregisterResources(server);
+  await bundler.registerResources(server);
+});
+
+bundler.on('prompts_changed', async () => {
+  bundler.unregisterPrompts(server);
+  await bundler.registerPrompts(server, 'my-server__');
 });
 
 await bundler.connect();
@@ -50,19 +64,42 @@ await bundler.connect();
 
 ### Methods
 
+#### Connection
+
 - `connect()` — Connect to the remote server
 - `close()` — Disconnect and stop reconnecting
-- `registerTools(server)` — Register remote tools onto an `McpServer`
-- `unregisterTools(server)` — Remove previously registered tools
-- `listTools()` — Get currently available remote tools
-- `getTools()` — Get cached tool list
 - `getState()` — Get connection state (`idle`, `connecting`, `connected`, `disconnected`)
+
+#### Tools
+
+- `registerTools(server, prefix?)` — Register remote tools onto an `McpServer`
+- `unregisterTools(server)` — Remove previously registered tools
+- `listTools()` — Fetch current tool list from remote server
+- `getTools()` — Get cached tool names
+
+#### Resources
+
+- `registerResources(server)` — Register remote resources onto an `McpServer`
+- `unregisterResources(server)` — Remove previously registered resources
+- `listResources()` — Fetch current resource list from remote server
+- `getResources()` — Get cached resource URIs
+
+#### Prompts
+
+- `registerPrompts(server, prefix?)` — Register remote prompts onto an `McpServer`
+- `unregisterPrompts(server)` — Remove previously registered prompts
+- `listPrompts()` — Fetch current prompt list from remote server
+- `getPrompts()` — Get cached prompt names
 
 ### Events
 
 - `connected` — Connection established
 - `disconnected` — Connection lost
-- `tools_changed` — Remote tool list changed (after reconnect)
+- `tools_changed` — Remote tool list changed
+- `resources_changed` — Remote resource list changed
+- `prompts_changed` — Remote prompt list changed
+
+All three `*_changed` events are driven by MCP `listChanged` notifications — the bundler subscribes to downstream servers and auto-refreshes when they signal changes.
 
 ## Development
 
