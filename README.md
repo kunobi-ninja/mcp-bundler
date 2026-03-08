@@ -1,6 +1,6 @@
 # @kunobi/mcp-bundler
 
-Connect to a remote HTTP MCP server and re-export its tools onto a local `McpServer`. Handles connection lifecycle, reconnection, and notifies when tools change.
+Connect to a remote MCP server and cache its tools, resources, and prompts locally. The core `McpBundler` is transport-agnostic and only handles connection lifecycle, metadata refresh, and direct forwarding. An optional `McpBundlerServerAdapter` can re-export that remote metadata onto a local `McpServer`.
 
 ## Install
 
@@ -11,39 +11,51 @@ npm install @kunobi/mcp-bundler
 ## Usage
 
 ```typescript
-import { McpBundler } from '@kunobi/mcp-bundler';
+import { McpBundler, McpBundlerServerAdapter } from '@kunobi/mcp-bundler';
 
 const bundler = new McpBundler({
   name: 'my-server',
-  url: 'http://127.0.0.1:3030/mcp',
+  transport: {
+    type: 'http',
+    url: 'http://127.0.0.1:3030/mcp',
+  },
   reconnect: { enabled: true, intervalMs: 5_000, maxRetries: Infinity },
 });
 
+const adapter = new McpBundlerServerAdapter(bundler, {
+  toolPrefix: 'my-server__',
+  promptPrefix: 'my-server__',
+  mapResource: (resource) => ({
+    name: `my-server__${resource.name}`,
+    uri: `my-server://resource/${encodeURIComponent(resource.uri)}`,
+  }),
+});
+
 bundler.on('connected', async () => {
-  await bundler.registerTools(server);
-  await bundler.registerResources(server);
-  await bundler.registerPrompts(server, 'my-server__');
+  await adapter.registerTools(server);
+  await adapter.registerResources(server);
+  await adapter.registerPrompts(server);
 });
 
 bundler.on('disconnected', () => {
-  bundler.unregisterTools(server);
-  bundler.unregisterResources(server);
-  bundler.unregisterPrompts(server);
+  adapter.unregisterTools(server);
+  adapter.unregisterResources(server);
+  adapter.unregisterPrompts(server);
 });
 
 bundler.on('tools_changed', async () => {
-  bundler.unregisterTools(server);
-  await bundler.registerTools(server);
+  adapter.unregisterTools(server);
+  await adapter.registerTools(server);
 });
 
 bundler.on('resources_changed', async () => {
-  bundler.unregisterResources(server);
-  await bundler.registerResources(server);
+  adapter.unregisterResources(server);
+  await adapter.registerResources(server);
 });
 
 bundler.on('prompts_changed', async () => {
-  bundler.unregisterPrompts(server);
-  await bundler.registerPrompts(server, 'my-server__');
+  adapter.unregisterPrompts(server);
+  await adapter.registerPrompts(server);
 });
 
 await bundler.connect();
@@ -56,40 +68,56 @@ await bundler.connect();
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `name` | `string` | required | Identifier for logging |
-| `url` | `string` | required | Remote MCP server HTTP URL |
+| `transport` | `McpTransportConfig` | required | Downstream MCP transport config (`http` or `stdio`) |
 | `reconnect.enabled` | `boolean` | `true` | Auto-reconnect on disconnect |
 | `reconnect.intervalMs` | `number` | `5000` | Delay between reconnect attempts |
 | `reconnect.maxRetries` | `number` | `Infinity` | Max reconnect attempts |
-| `logger` | `function` | `console.error` | `(level, message, data?) => void` |
+| `logger` | `function` | no-op | `(level, message, data?) => void` |
 
 ### Methods
 
 #### Connection
 
 - `connect()` — Connect to the remote server
+- `reconnectNow()` — Cancel any pending reconnect timer and retry immediately
 - `close()` — Disconnect and stop reconnecting
 - `getState()` — Get connection state (`idle`, `connecting`, `connected`, `disconnected`)
 
-#### Tools
+#### Metadata and forwarding
 
-- `registerTools(server, prefix?)` — Register remote tools onto an `McpServer`
-- `unregisterTools(server)` — Remove previously registered tools
-- `listTools()` — Fetch current tool list from remote server
+- `listTools()` — Fetch current tool list from the downstream server
+- `getToolDefinitions()` — Get cached full downstream tool definitions
 - `getTools()` — Get cached tool names
-
-#### Resources
-
-- `registerResources(server)` — Register remote resources onto an `McpServer`
-- `unregisterResources(server)` — Remove previously registered resources
-- `listResources()` — Fetch current resource list from remote server
+- `callTool(name, args?)` — Forward a tool call directly to the downstream server
+- `listResources()` — Fetch current resource list from the downstream server
+- `getResourceDefinitions()` — Get cached full downstream resource definitions
 - `getResources()` — Get cached resource URIs
-
-#### Prompts
-
-- `registerPrompts(server, prefix?)` — Register remote prompts onto an `McpServer`
-- `unregisterPrompts(server)` — Remove previously registered prompts
-- `listPrompts()` — Fetch current prompt list from remote server
+- `readResource(uri)` — Read a downstream resource directly
+- `listPrompts()` — Fetch current prompt list from the downstream server
+- `getPromptDefinitions()` — Get cached full downstream prompt definitions
 - `getPrompts()` — Get cached prompt names
+- `getPrompt(name, args?)` — Fetch a downstream prompt directly
+
+### `new McpBundlerServerAdapter(bundler, options?)`
+
+Use the optional server adapter when you want to re-register a bundled server onto a local `McpServer`.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `toolPrefix` | `string` | `""` | Prefix applied to re-exported tool names |
+| `promptPrefix` | `string` | `""` | Prefix applied to re-exported prompt names |
+| `mapToolName` | `(tool) => string` | — | Full control over the local tool name |
+| `mapPromptName` | `(prompt) => string` | — | Full control over the local prompt name |
+| `mapResource` | `(resource) => { name, uri, ... }` | identity | Full control over the local resource name and URI |
+
+### Adapter methods
+
+- `registerTools(server)` — Register cached downstream tools on a local `McpServer`
+- `unregisterTools(server)` — Remove the tools previously registered by this adapter
+- `registerResources(server)` — Register cached downstream resources on a local `McpServer`
+- `unregisterResources(server)` — Remove the resources previously registered by this adapter
+- `registerPrompts(server)` — Register cached downstream prompts on a local `McpServer`
+- `unregisterPrompts(server)` — Remove the prompts previously registered by this adapter
 
 ### Events
 

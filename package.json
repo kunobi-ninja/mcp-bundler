@@ -1,7 +1,7 @@
 {
   "name": "@kunobi/mcp-bundler",
   "version": "0.0.1",
-  "description": "Reusable MCP bundler — connect to remote HTTP MCP servers and re-export tools",
+  "description": "Generic MCP client/cache with an optional local server adapter",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {

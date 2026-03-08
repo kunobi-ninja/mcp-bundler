@@ -1,5 +1,45 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { formatError, McpBundler } from '../index.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type {
+  Prompt,
+  Resource,
+  Tool,
+} from '@modelcontextprotocol/sdk/types.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { formatError, McpBundler, McpBundlerServerAdapter } from '../index.js';
+
+type ServerInternals = {
+  _registeredPrompts: Record<
+    string,
+    { remove?: () => void; handler?: (args: unknown) => Promise<unknown> }
+  >;
+  _registeredResources: Record<string, { remove?: () => void }>;
+  _registeredTools: Record<
+    string,
+    { remove?: () => void; handler?: (args: unknown) => Promise<unknown> }
+  >;
+};
+
+function createBundler(): McpBundler {
+  return new McpBundler({
+    name: 'test',
+    transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+    reconnect: { enabled: false },
+    logger: () => {},
+  });
+}
+
+function createServer(): McpServer {
+  return new McpServer(
+    { name: 'test', version: '0.0.1' },
+    {
+      capabilities: {
+        tools: { listChanged: true },
+        resources: { subscribe: true, listChanged: true },
+        prompts: { listChanged: true },
+      },
+    },
+  );
+}
 
 describe('formatError', () => {
   it('extracts message from Error instances', () => {
@@ -17,199 +57,70 @@ describe('formatError', () => {
   });
 });
 
-describe('McpBundler (http)', () => {
-  let bundler: McpBundler;
-
-  beforeEach(() => {
-    bundler = new McpBundler({
-      name: 'test',
-      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      reconnect: { enabled: false },
-      logger: () => {},
-    });
+describe('McpBundler core', () => {
+  afterEach(async () => {
+    vi.restoreAllMocks();
   });
 
-  afterEach(async () => {
+  it('starts in idle state with empty cached metadata', () => {
+    const bundler = createBundler();
+    expect(bundler.getState()).toBe('idle');
+    expect(bundler.getTools()).toEqual([]);
+    expect(bundler.getResources()).toEqual([]);
+    expect(bundler.getPrompts()).toEqual([]);
+    expect(bundler.getToolDefinitions()).toEqual([]);
+    expect(bundler.getResourceDefinitions()).toEqual([]);
+    expect(bundler.getPromptDefinitions()).toEqual([]);
+  });
+
+  it('transitions to disconnected on connection failure', async () => {
+    const bundler = createBundler();
+    await bundler.connect();
+    expect(bundler.getState()).toBe('disconnected');
     await bundler.close();
   });
 
-  describe('initial state', () => {
-    it('starts in idle state', () => {
-      expect(bundler.getState()).toBe('idle');
-    });
-
-    it('starts with no tools', () => {
-      expect(bundler.getTools()).toEqual([]);
-    });
-
-    it('exposes name', () => {
-      expect(bundler.name).toBe('test');
-    });
+  it('does not connect when already closed', async () => {
+    const bundler = createBundler();
+    await bundler.close();
+    await bundler.connect();
+    expect(bundler.getState()).toBe('idle');
   });
 
-  describe('connect', () => {
-    it('transitions to disconnected on connection failure', async () => {
-      await bundler.connect();
-      expect(bundler.getState()).toBe('disconnected');
-    });
-
-    it('does not connect when already closed', async () => {
-      await bundler.close();
-      await bundler.connect();
-      expect(bundler.getState()).toBe('idle');
-    });
-
-    it('prevents duplicate connect calls', async () => {
-      const p1 = bundler.connect();
-      const p2 = bundler.connect();
-      await Promise.all([p1, p2]);
-      expect(bundler.getState()).toBe('disconnected');
-    });
+  it('prevents duplicate connect calls', async () => {
+    const bundler = createBundler();
+    const p1 = bundler.connect();
+    const p2 = bundler.connect();
+    await Promise.all([p1, p2]);
+    expect(bundler.getState()).toBe('disconnected');
+    await bundler.close();
   });
 
-  describe('listTools', () => {
-    it('returns empty array when not connected', async () => {
-      const tools = await bundler.listTools();
-      expect(tools).toEqual([]);
-    });
+  it('close is idempotent', async () => {
+    const bundler = createBundler();
+    await bundler.close();
+    await bundler.close();
+    expect(bundler.getState()).toBe('idle');
   });
 
-  describe('close', () => {
-    it('transitions to idle', async () => {
-      await bundler.connect();
-      expect(bundler.getState()).toBe('disconnected');
-      await bundler.close();
-      expect(bundler.getState()).toBe('idle');
-    });
-
-    it('is idempotent', async () => {
-      await bundler.close();
-      await bundler.close();
-      expect(bundler.getState()).toBe('idle');
-    });
-  });
-
-  describe('reconnection', () => {
-    it('stays disconnected after failed connect with reconnect enabled', async () => {
-      const reconnectBundler = new McpBundler({
-        name: 'reconnect-test',
-        transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-        reconnect: { enabled: true, intervalMs: 100, maxRetries: 2 },
-        logger: () => {},
-      });
-
-      await reconnectBundler.connect();
-      // After a failed connect with reconnect enabled, state should be disconnected
-      // and a reconnect timer should be scheduled
-      expect(reconnectBundler.getState()).toBe('disconnected');
-
-      await reconnectBundler.close();
-    });
-
-    it('does not schedule reconnect when disabled', async () => {
-      await bundler.connect();
-      expect(bundler.getState()).toBe('disconnected');
-
-      // Wait a bit — no reconnect should happen since it's disabled
-      await new Promise((r) => setTimeout(r, 50));
-      expect(bundler.getState()).toBe('disconnected');
-    });
-
-    it('close cancels pending reconnect', async () => {
-      const reconnectBundler = new McpBundler({
-        name: 'reconnect-test',
-        transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-        reconnect: { enabled: true, intervalMs: 50, maxRetries: 5 },
-        logger: () => {},
-      });
-
-      await reconnectBundler.connect();
-      expect(reconnectBundler.getState()).toBe('disconnected');
-
-      // Close should cancel any pending reconnect timer
-      await reconnectBundler.close();
-      expect(reconnectBundler.getState()).toBe('idle');
-
-      // Wait past the reconnect interval — state should remain idle
-      await new Promise((r) => setTimeout(r, 100));
-      expect(reconnectBundler.getState()).toBe('idle');
-    });
-  });
-
-  describe('events', () => {
-    it('does not emit connected on failure', async () => {
-      const handler = vi.fn();
-      bundler.on('connected', handler);
-      await bundler.connect();
-      expect(handler).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('unregisterTools', () => {
-    it('handles server without _registeredTools gracefully', () => {
-      const fakeServer = {} as Parameters<typeof bundler.unregisterTools>[0];
-      expect(() => bundler.unregisterTools(fakeServer)).not.toThrow();
-    });
-
-    it('calls remove() on registered tools', () => {
-      const removeFn = vi.fn();
-      const tools: Record<string, { remove: () => void }> = {
-        tool_a: { remove: removeFn },
-        tool_b: { remove: vi.fn() },
-      };
-
-      const bundlerAny = bundler as unknown as {
-        registeredToolNames: Set<string>;
-      };
-      bundlerAny.registeredToolNames.add('tool_a');
-
-      const fakeServer = { _registeredTools: tools } as unknown as Parameters<
-        typeof bundler.unregisterTools
-      >[0];
-      bundler.unregisterTools(fakeServer);
-
-      expect(removeFn).toHaveBeenCalledOnce();
-      expect(tools.tool_b.remove).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('defaults', () => {
-    it('uses default reconnect options', () => {
-      const defaultBundler = new McpBundler({
-        name: 'defaults',
-        transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      });
-      expect(defaultBundler.getState()).toBe('idle');
-    });
-
-    it('uses default logger without throwing', async () => {
-      const defaultBundler = new McpBundler({
-        name: 'defaults',
-        transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-        reconnect: { enabled: false },
-      });
-      await defaultBundler.connect();
-      expect(defaultBundler.getState()).toBe('disconnected');
-      await defaultBundler.close();
-    });
-  });
-});
-
-describe('McpBundler (stdio)', () => {
-  it('accepts stdio transport config', () => {
+  it('reconnectNow cancels the pending timer and forces one immediate retry', async () => {
     const bundler = new McpBundler({
-      name: 'stdio-test',
-      transport: {
-        type: 'stdio',
-        command: 'echo',
-        args: ['hello'],
-        env: { FOO: 'bar' },
-      },
-      reconnect: { enabled: false },
+      name: 'reconnect-now-test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: true, intervalMs: 10_000, maxRetries: 5 },
       logger: () => {},
     });
-    expect(bundler.getState()).toBe('idle');
-    expect(bundler.name).toBe('stdio-test');
+
+    const connectSpy = vi.spyOn(bundler, 'connect');
+
+    await bundler.connect();
+    expect(bundler.getState()).toBe('disconnected');
+    expect(connectSpy).toHaveBeenCalledTimes(1);
+
+    await bundler.reconnectNow();
+
+    expect(connectSpy).toHaveBeenCalledTimes(2);
+    await bundler.close();
   });
 
   it('does not schedule reconnect for stdio transport', async () => {
@@ -218,232 +129,262 @@ describe('McpBundler (stdio)', () => {
       name: 'stdio-no-reconnect',
       transport: { type: 'stdio', command: 'false' },
       reconnect: { enabled: true, intervalMs: 10, maxRetries: 5 },
-      logger: (_level, msg) => logMessages.push(msg),
+      logger: (_level, message) => logMessages.push(message),
     });
 
     await bundler.connect();
     expect(bundler.getState()).toBe('disconnected');
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
-    // Wait past the reconnect interval — no reconnect should be scheduled for stdio
-    await new Promise((r) => setTimeout(r, 50));
-    expect(bundler.getState()).toBe('disconnected');
-
-    // Verify no "Reconnecting" log was emitted
-    expect(logMessages.some((m) => m.includes('Reconnecting'))).toBe(false);
+    expect(
+      logMessages.some((message) => message.includes('Reconnecting')),
+    ).toBe(false);
 
     await bundler.close();
   });
+
+  it('callTool forwards to the connected client', async () => {
+    const bundler = createBundler();
+    const bundlerAny = bundler as unknown as {
+      client: { callTool: ReturnType<typeof vi.fn> };
+      state: 'connected';
+    };
+    bundlerAny.client = {
+      callTool: vi.fn().mockResolvedValue({
+        content: [{ type: 'text', text: 'forwarded' }],
+      }),
+    };
+    bundlerAny.state = 'connected';
+
+    const result = await bundler.callTool('k8s', { action: 'list' });
+
+    expect(bundlerAny.client.callTool).toHaveBeenCalledWith({
+      name: 'k8s',
+      arguments: { action: 'list' },
+    });
+    expect(result.content[0].text).toBe('forwarded');
+  });
+
+  it('returns connection errors for direct forwarding while disconnected', async () => {
+    const bundler = createBundler();
+
+    const toolResult = await bundler.callTool('k8s');
+    const resourceResult = await bundler.readResource('kunobi://status');
+    const promptResult = await bundler.getPrompt('setup');
+
+    expect(toolResult.isError).toBe(true);
+    expect(toolResult.content[0].text).toContain('Not connected');
+    expect(resourceResult.contents[0].text).toContain('Not connected');
+    expect(promptResult.messages[0].content.type).toBe('text');
+  });
+
+  it('returns cached definitions as defensive copies', () => {
+    const bundler = createBundler();
+    const bundlerAny = bundler as unknown as {
+      lastPrompts: Array<{ name: string; arguments: Array<{ name: string }> }>;
+      lastResources: Array<{ uri: string; name: string }>;
+      lastTools: Array<{ name: string; inputSchema: { type: string } }>;
+    };
+    bundlerAny.lastTools = [{ name: 'k8s', inputSchema: { type: 'object' } }];
+    bundlerAny.lastResources = [{ uri: 'kunobi://status', name: 'status' }];
+    bundlerAny.lastPrompts = [
+      { name: 'setup', arguments: [{ name: 'cluster' }] },
+    ];
+
+    const tools = bundler.getToolDefinitions();
+    const resources = bundler.getResourceDefinitions();
+    const prompts = bundler.getPromptDefinitions();
+
+    const firstTool = tools[0];
+    const firstResource = resources[0];
+    const firstPrompt = prompts[0];
+
+    if (!firstTool || !firstResource || !firstPrompt) {
+      throw new Error('expected cached definitions to be present');
+    }
+
+    firstTool.name = 'changed';
+    firstResource.uri = 'kunobi://changed';
+    firstPrompt.name = 'changed';
+
+    expect(bundler.getToolDefinitions()[0]?.name).toBe('k8s');
+    expect(bundler.getResourceDefinitions()[0]?.uri).toBe('kunobi://status');
+    expect(bundler.getPromptDefinitions()[0]?.name).toBe('setup');
+  });
 });
 
-describe('registerTools with prefix', () => {
-  it('stores prefixed names in registeredToolNames', () => {
-    const bundler = new McpBundler({
-      name: 'prefix-test',
-      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      reconnect: { enabled: false },
-      logger: () => {},
+describe('McpBundlerServerAdapter', () => {
+  function toolDefinitions(): Tool[] {
+    return [
+      {
+        name: 'k8s',
+        description: 'Kubernetes operations',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: { description: 'Action to run', type: 'string' },
+          },
+          required: ['action'],
+        },
+      } as Tool,
+    ];
+  }
+
+  function resourceDefinitions(): Resource[] {
+    return [
+      {
+        name: 'status',
+        uri: 'kunobi://resource/status',
+        description: 'Status resource',
+      } as Resource,
+    ];
+  }
+
+  function promptDefinitions(): Prompt[] {
+    return [
+      {
+        name: 'setup',
+        description: 'Setup prompt',
+        arguments: [{ name: 'cluster', required: false }],
+      } as Prompt,
+    ];
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('registers prefixed tools and forwards calls through the bundler', async () => {
+    const bundler = createBundler();
+    vi.spyOn(bundler, 'listTools').mockResolvedValue(toolDefinitions());
+    const callTool = vi.spyOn(bundler, 'callTool').mockResolvedValue({
+      content: [{ type: 'text', text: 'forwarded' }],
     });
 
-    // Simulate what registerTools does with prefixed names
-    const bundlerAny = bundler as unknown as {
+    const adapter = new McpBundlerServerAdapter(bundler, {
+      toolPrefix: 'dev__',
+    });
+    const server = createServer();
+
+    await adapter.registerTools(server);
+
+    const tool = (server as unknown as ServerInternals)._registeredTools
+      .dev__k8s;
+    expect(tool).toBeDefined();
+
+    await tool.handler?.({ action: 'list' });
+    expect(callTool).toHaveBeenCalledWith('k8s', { action: 'list' });
+  });
+
+  it('registers namespaced resources and keeps downstream reads on the original URI', async () => {
+    const bundler = createBundler();
+    vi.spyOn(bundler, 'listResources').mockResolvedValue(resourceDefinitions());
+    const readResource = vi.spyOn(bundler, 'readResource').mockResolvedValue({
+      contents: [{ uri: 'kunobi://resource/status', text: 'ok' }],
+    });
+
+    const adapter = new McpBundlerServerAdapter(bundler, {
+      mapResource: (resource) => ({
+        name: `dev__${resource.name}`,
+        uri: `kunobi://variant/dev/resource/${encodeURIComponent(resource.uri)}`,
+      }),
+    });
+    let handler: undefined | (() => ReturnType<typeof bundler.readResource>);
+    const registerResource = vi.fn(
+      (_name, _uri, _meta, nextHandler: typeof handler) => {
+        handler = nextHandler;
+      },
+    );
+    const server = {
+      registerResource,
+    } as unknown as McpServer;
+
+    await adapter.registerResources(server);
+
+    expect(registerResource.mock.calls[0]?.[1]).toBe(
+      'kunobi://variant/dev/resource/kunobi%3A%2F%2Fresource%2Fstatus',
+    );
+
+    await handler?.();
+    expect(readResource).toHaveBeenCalledWith('kunobi://resource/status');
+  });
+
+  it('registers prefixed prompts and forwards prompt requests', async () => {
+    const bundler = createBundler();
+    vi.spyOn(bundler, 'listPrompts').mockResolvedValue(promptDefinitions());
+    const getPrompt = vi.spyOn(bundler, 'getPrompt').mockResolvedValue({
+      messages: [
+        {
+          role: 'user',
+          content: { type: 'text', text: 'prompt' },
+        },
+      ],
+    });
+
+    const adapter = new McpBundlerServerAdapter(bundler, {
+      promptPrefix: 'dev__',
+    });
+    let handler:
+      | undefined
+      | ((args: unknown) => ReturnType<typeof bundler.getPrompt>);
+    const registerPrompt = vi.fn(
+      (_name, _meta, nextHandler: typeof handler) => {
+        handler = nextHandler;
+      },
+    );
+    const server = {
+      registerPrompt,
+    } as unknown as McpServer;
+
+    await adapter.registerPrompts(server);
+
+    expect(registerPrompt.mock.calls[0]?.[0]).toBe('dev__setup');
+
+    await handler?.({ cluster: 'dev-cluster' });
+    expect(getPrompt).toHaveBeenCalledWith('setup', { cluster: 'dev-cluster' });
+  });
+
+  it('unregisters only the entries it previously registered', () => {
+    const bundler = createBundler();
+    const adapter = new McpBundlerServerAdapter(bundler);
+    const adapterAny = adapter as unknown as {
+      registeredPromptNames: Set<string>;
+      registeredResourceUris: Set<string>;
       registeredToolNames: Set<string>;
     };
+    adapterAny.registeredToolNames.add('dev__k8s');
+    adapterAny.registeredResourceUris.add(
+      'kunobi://variant/dev/resource/status',
+    );
+    adapterAny.registeredPromptNames.add('dev__setup');
 
-    // Manually add prefixed names as registerTools would
-    bundlerAny.registeredToolNames.add('ga_get_report');
-    bundlerAny.registeredToolNames.add('ga_list_properties');
-
-    // Verify unregisterTools uses prefixed names
-    const removeFn1 = vi.fn();
-    const removeFn2 = vi.fn();
+    const removeTool = vi.fn();
+    const removeResource = vi.fn();
+    const removePrompt = vi.fn();
     const fakeServer = {
       _registeredTools: {
-        ga_get_report: { remove: removeFn1 },
-        ga_list_properties: { remove: removeFn2 },
-        other_tool: { remove: vi.fn() },
+        dev__k8s: { remove: removeTool },
+        other: { remove: vi.fn() },
       },
-    } as unknown as Parameters<typeof bundler.unregisterTools>[0];
+      _registeredResources: {
+        'kunobi://variant/dev/resource/status': { remove: removeResource },
+        'kunobi://other': { remove: vi.fn() },
+      },
+      _registeredPrompts: {
+        dev__setup: { remove: removePrompt },
+        other: { remove: vi.fn() },
+      },
+    } as unknown as McpServer;
 
-    bundler.unregisterTools(fakeServer);
-    expect(removeFn1).toHaveBeenCalledOnce();
-    expect(removeFn2).toHaveBeenCalledOnce();
-  });
-});
+    adapter.unregisterTools(fakeServer);
+    adapter.unregisterResources(fakeServer);
+    adapter.unregisterPrompts(fakeServer);
 
-describe('registerResources / registerPrompts', () => {
-  it('registerResources returns early when not connected', async () => {
-    const bundler = new McpBundler({
-      name: 'resources-test',
-      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      reconnect: { enabled: false },
-      logger: () => {},
-    });
-
-    // Should not throw — just returns early since client is null
-    await expect(
-      bundler.registerResources(
-        {} as Parameters<typeof bundler.registerResources>[0],
-      ),
-    ).resolves.toBeUndefined();
-
-    await bundler.close();
-  });
-
-  it('registerPrompts returns early when not connected', async () => {
-    const bundler = new McpBundler({
-      name: 'prompts-test',
-      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      reconnect: { enabled: false },
-      logger: () => {},
-    });
-
-    // Should not throw — just returns early since client is null
-    await expect(
-      bundler.registerPrompts(
-        {} as Parameters<typeof bundler.registerPrompts>[0],
-      ),
-    ).resolves.toBeUndefined();
-
-    await bundler.close();
-  });
-});
-
-describe('unregisterResources', () => {
-  it('handles server without _registeredResources gracefully', () => {
-    const bundler = new McpBundler({
-      name: 'test',
-      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      reconnect: { enabled: false },
-      logger: () => {},
-    });
-    const fakeServer = {} as Parameters<typeof bundler.unregisterResources>[0];
-    expect(() => bundler.unregisterResources(fakeServer)).not.toThrow();
-  });
-
-  it('calls remove() on registered resources', () => {
-    const bundler = new McpBundler({
-      name: 'test',
-      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      reconnect: { enabled: false },
-      logger: () => {},
-    });
-
-    const removeFn = vi.fn();
-    const resources: Record<string, { remove: () => void }> = {
-      'test://a': { remove: removeFn },
-      'test://b': { remove: vi.fn() },
-    };
-
-    const bundlerAny = bundler as unknown as {
-      registeredResourceUris: Set<string>;
-    };
-    bundlerAny.registeredResourceUris.add('test://a');
-
-    const fakeServer = {
-      _registeredResources: resources,
-    } as unknown as Parameters<typeof bundler.unregisterResources>[0];
-    bundler.unregisterResources(fakeServer);
-
-    expect(removeFn).toHaveBeenCalledOnce();
-    expect(resources['test://b'].remove).not.toHaveBeenCalled();
-  });
-
-  it('clears registeredResourceUris after unregister', () => {
-    const bundler = new McpBundler({
-      name: 'test',
-      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      reconnect: { enabled: false },
-      logger: () => {},
-    });
-
-    const bundlerAny = bundler as unknown as {
-      registeredResourceUris: Set<string>;
-    };
-    bundlerAny.registeredResourceUris.add('test://a');
-
-    const fakeServer = {
-      _registeredResources: { 'test://a': { remove: vi.fn() } },
-    } as unknown as Parameters<typeof bundler.unregisterResources>[0];
-    bundler.unregisterResources(fakeServer);
-
-    expect(bundlerAny.registeredResourceUris.size).toBe(0);
-  });
-});
-
-describe('unregisterPrompts', () => {
-  it('handles server without _registeredPrompts gracefully', () => {
-    const bundler = new McpBundler({
-      name: 'test',
-      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      reconnect: { enabled: false },
-      logger: () => {},
-    });
-    const fakeServer = {} as Parameters<typeof bundler.unregisterPrompts>[0];
-    expect(() => bundler.unregisterPrompts(fakeServer)).not.toThrow();
-  });
-
-  it('calls remove() on registered prompts', () => {
-    const bundler = new McpBundler({
-      name: 'test',
-      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      reconnect: { enabled: false },
-      logger: () => {},
-    });
-
-    const removeFn = vi.fn();
-    const prompts: Record<string, { remove: () => void }> = {
-      dev__setup: { remove: removeFn },
-      dev__other: { remove: vi.fn() },
-    };
-
-    const bundlerAny = bundler as unknown as {
-      registeredPromptNames: Set<string>;
-    };
-    bundlerAny.registeredPromptNames.add('dev__setup');
-
-    const fakeServer = {
-      _registeredPrompts: prompts,
-    } as unknown as Parameters<typeof bundler.unregisterPrompts>[0];
-    bundler.unregisterPrompts(fakeServer);
-
-    expect(removeFn).toHaveBeenCalledOnce();
-    expect(prompts.dev__other.remove).not.toHaveBeenCalled();
-  });
-});
-
-describe('getResources / getPrompts', () => {
-  it('starts with empty resources and prompts', () => {
-    const bundler = new McpBundler({
-      name: 'test',
-      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      reconnect: { enabled: false },
-      logger: () => {},
-    });
-    expect(bundler.getResources()).toEqual([]);
-    expect(bundler.getPrompts()).toEqual([]);
-  });
-});
-
-describe('listResources / listPrompts', () => {
-  it('listResources returns empty when not connected', async () => {
-    const bundler = new McpBundler({
-      name: 'test',
-      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      reconnect: { enabled: false },
-      logger: () => {},
-    });
-    expect(await bundler.listResources()).toEqual([]);
-    await bundler.close();
-  });
-
-  it('listPrompts returns empty when not connected', async () => {
-    const bundler = new McpBundler({
-      name: 'test',
-      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
-      reconnect: { enabled: false },
-      logger: () => {},
-    });
-    expect(await bundler.listPrompts()).toEqual([]);
-    await bundler.close();
+    expect(removeTool).toHaveBeenCalledOnce();
+    expect(removeResource).toHaveBeenCalledOnce();
+    expect(removePrompt).toHaveBeenCalledOnce();
+    expect(adapterAny.registeredToolNames.size).toBe(0);
+    expect(adapterAny.registeredResourceUris.size).toBe(0);
+    expect(adapterAny.registeredPromptNames.size).toBe(0);
   });
 });

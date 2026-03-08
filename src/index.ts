@@ -2,14 +2,14 @@ import { EventEmitter } from 'node:events';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type {
   CallToolResult,
+  GetPromptResult,
   Prompt,
+  ReadResourceResult,
   Resource,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { z } from 'zod';
 
 export type ConnectionState =
   | 'idle'
@@ -53,30 +53,8 @@ export function formatError(error: unknown): string {
   return JSON.stringify(error);
 }
 
-function zodShapeFromJsonSchema(
-  inputSchema: Tool['inputSchema'],
-): z.ZodTypeAny {
-  const properties = inputSchema?.properties as
-    | Record<string, { description?: string }>
-    | undefined;
-  const required = (inputSchema?.required as string[]) || [];
-
-  if (!properties || Object.keys(properties).length === 0) {
-    return z.object({}).passthrough();
-  }
-
-  const shape: Record<string, z.ZodTypeAny> = {};
-  for (const [name, prop] of Object.entries(properties)) {
-    let field: z.ZodTypeAny = z.any();
-    if (prop?.description) {
-      field = field.describe(prop.description);
-    }
-    if (!required.includes(name)) {
-      field = field.optional();
-    }
-    shape[name] = field;
-  }
-  return z.object(shape).passthrough();
+function cloneDefinitions<T>(definitions: T[]): T[] {
+  return definitions.map((definition) => structuredClone(definition));
 }
 
 export class McpBundler extends EventEmitter<McpBundlerEvents> {
@@ -98,12 +76,9 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   private state: ConnectionState = 'idle';
   private retryCount = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private registeredToolNames: Set<string> = new Set();
-  private registeredResourceUris: Set<string> = new Set();
-  private registeredPromptNames: Set<string> = new Set();
-  private lastToolNames: string[] = [];
-  private lastResourceUris: string[] = [];
-  private lastPromptNames: string[] = [];
+  private lastTools: Tool[] = [];
+  private lastResources: Resource[] = [];
+  private lastPrompts: Prompt[] = [];
   private closed = false;
 
   constructor(options: McpBundlerOptions) {
@@ -123,15 +98,61 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   }
 
   getTools(): string[] {
-    return [...this.lastToolNames];
+    return this.lastTools.map((tool) => tool.name);
   }
 
   getResources(): string[] {
-    return [...this.lastResourceUris];
+    return this.lastResources.map((resource) => resource.uri);
   }
 
   getPrompts(): string[] {
-    return [...this.lastPromptNames];
+    return this.lastPrompts.map((prompt) => prompt.name);
+  }
+
+  getToolDefinitions(): Tool[] {
+    return cloneDefinitions(this.lastTools);
+  }
+
+  getResourceDefinitions(): Resource[] {
+    return cloneDefinitions(this.lastResources);
+  }
+
+  getPromptDefinitions(): Prompt[] {
+    return cloneDefinitions(this.lastPrompts);
+  }
+
+  async reconnectNow(): Promise<void> {
+    if (this.closed) return;
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    if (this.state === 'connecting') {
+      this.logger(
+        'info',
+        `[${this.name}] reconnectNow skipped while a connection attempt is already in progress`,
+      );
+      return;
+    }
+
+    this.retryCount = 0;
+    this.state = 'idle';
+
+    if (this.client) {
+      try {
+        await this.client.close();
+      } catch (error) {
+        this.logger('warn', `[${this.name}] Error while forcing reconnect`, {
+          error: formatError(error),
+        });
+      }
+      this.client = null;
+    }
+
+    this.activeTransport = null;
+    await this.connect();
   }
 
   async connect(): Promise<void> {
@@ -155,8 +176,8 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
               autoRefresh: true,
               onChanged: (_err, tools) => {
                 if (tools) {
-                  this.lastToolNames = tools.map((t) => t.name);
-                  this.emit('tools_changed', tools);
+                  this.lastTools = cloneDefinitions(tools);
+                  this.emit('tools_changed', this.getToolDefinitions());
                 }
               },
             },
@@ -164,8 +185,8 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
               autoRefresh: true,
               onChanged: (_err, resources) => {
                 if (resources) {
-                  this.lastResourceUris = resources.map((r) => r.uri);
-                  this.emit('resources_changed', resources);
+                  this.lastResources = cloneDefinitions(resources);
+                  this.emit('resources_changed', this.getResourceDefinitions());
                 }
               },
             },
@@ -173,8 +194,8 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
               autoRefresh: true,
               onChanged: (_err, prompts) => {
                 if (prompts) {
-                  this.lastPromptNames = prompts.map((p) => p.name);
-                  this.emit('prompts_changed', prompts);
+                  this.lastPrompts = cloneDefinitions(prompts);
+                  this.emit('prompts_changed', this.getPromptDefinitions());
                 }
               },
             },
@@ -230,14 +251,9 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       this.retryCount = 0;
       this.logger('info', `[${this.name}] Connected`);
 
-      const tools = await this.listTools();
-      this.lastToolNames = tools.map((t) => t.name);
-
-      const resources = await this.listResources();
-      this.lastResourceUris = resources.map((r) => r.uri);
-
-      const prompts = await this.listPrompts();
-      this.lastPromptNames = prompts.map((p) => p.name);
+      await this.listTools();
+      await this.listResources();
+      await this.listPrompts();
 
       this.emit('connected');
     } catch (error) {
@@ -253,7 +269,8 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     if (!this.client || this.state !== 'connected') return [];
     try {
       const result = await this.client.listTools();
-      return result.tools;
+      this.lastTools = cloneDefinitions(result.tools);
+      return this.getToolDefinitions();
     } catch (error) {
       this.logger('error', `[${this.name}] Failed to list tools`, {
         error: formatError(error),
@@ -268,7 +285,8 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     if (!capabilities?.resources) return [];
     try {
       const result = await this.client.listResources();
-      return result.resources;
+      this.lastResources = cloneDefinitions(result.resources);
+      return this.getResourceDefinitions();
     } catch (error) {
       this.logger('error', `[${this.name}] Failed to list resources`, {
         error: formatError(error),
@@ -283,7 +301,8 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     if (!capabilities?.prompts) return [];
     try {
       const result = await this.client.listPrompts();
-      return result.prompts;
+      this.lastPrompts = cloneDefinitions(result.prompts);
+      return this.getPromptDefinitions();
     } catch (error) {
       this.logger('error', `[${this.name}] Failed to list prompts`, {
         error: formatError(error),
@@ -292,239 +311,116 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     }
   }
 
-  async registerTools(server: McpServer, prefix = ''): Promise<void> {
-    const tools = await this.listTools();
+  async callTool(
+    name: string,
+    arguments_: Record<string, unknown> = {},
+  ): Promise<CallToolResult> {
+    this.logger('info', `[${this.name}] Forwarding call: ${name}`);
 
-    for (const tool of tools) {
-      const registeredName = prefix + tool.name;
-      this.logger('info', `[${this.name}] Bundling tool: ${registeredName}`);
+    if (!this.client || this.state !== 'connected') {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `[${this.name}] Not connected — cannot call ${name}`,
+          },
+        ],
+        isError: true,
+      };
+    }
 
-      const inputSchema = zodShapeFromJsonSchema(tool.inputSchema);
-      const originalName = tool.name;
-
-      server.registerTool(
-        registeredName,
-        {
-          description: tool.description,
-          inputSchema,
-        },
-        async (args) => {
-          this.logger(
-            'info',
-            `[${this.name}] Forwarding call: ${registeredName} → ${originalName}`,
-          );
-          if (!this.client || this.state !== 'connected') {
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `[${this.name}] Not connected — cannot call ${originalName}`,
-                },
-              ],
-              isError: true,
-            };
-          }
-          try {
-            const result = await this.client.callTool({
-              name: originalName,
-              arguments: args as Record<string, unknown>,
-            });
-            return result as CallToolResult;
-          } catch (error) {
-            const msg = formatError(error);
-            this.logger(
-              'error',
-              `[${this.name}] Tool call failed: ${originalName}`,
-              { error: msg },
-            );
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `[${this.name}] ${originalName} failed: ${msg}`,
-                },
-              ],
-              isError: true,
-            };
-          }
-        },
-      );
-
-      this.registeredToolNames.add(registeredName);
+    try {
+      return (await this.client.callTool({
+        name,
+        arguments: arguments_,
+      })) as CallToolResult;
+    } catch (error) {
+      const msg = formatError(error);
+      this.logger('error', `[${this.name}] Tool call failed: ${name}`, {
+        error: msg,
+      });
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `[${this.name}] ${name} failed: ${msg}`,
+          },
+        ],
+        isError: true,
+      };
     }
   }
 
-  async registerResources(server: McpServer): Promise<void> {
-    const resources = await this.listResources();
-    if (resources.length === 0) return;
+  async readResource(uri: string): Promise<ReadResourceResult> {
+    if (!this.client || this.state !== 'connected') {
+      return {
+        contents: [
+          {
+            uri,
+            text: `[${this.name}] Not connected — cannot read ${uri}`,
+          },
+        ],
+      };
+    }
 
-    for (const resource of resources) {
-      this.logger('info', `[${this.name}] Bundling resource: ${resource.uri}`);
-
-      server.registerResource(
-        resource.name,
-        resource.uri,
-        { description: resource.description, mimeType: resource.mimeType },
-        async (uri) => {
-          if (!this.client || this.state !== 'connected') {
-            return {
-              contents: [
-                {
-                  uri: uri.href,
-                  text: `[${this.name}] Not connected — cannot read ${resource.uri}`,
-                },
-              ],
-            };
-          }
-          try {
-            const result = await this.client.readResource({
-              uri: resource.uri,
-            });
-            return result;
-          } catch (error) {
-            const msg = formatError(error);
-            this.logger(
-              'error',
-              `[${this.name}] Resource read failed: ${resource.uri}`,
-              { error: msg },
-            );
-            return {
-              contents: [
-                {
-                  uri: uri.href,
-                  text: `[${this.name}] ${resource.uri} read failed: ${msg}`,
-                },
-              ],
-            };
-          }
-        },
-      );
-
-      this.registeredResourceUris.add(resource.uri);
+    try {
+      return await this.client.readResource({ uri });
+    } catch (error) {
+      const msg = formatError(error);
+      this.logger('error', `[${this.name}] Resource read failed: ${uri}`, {
+        error: msg,
+      });
+      return {
+        contents: [
+          {
+            uri,
+            text: `[${this.name}] ${uri} read failed: ${msg}`,
+          },
+        ],
+      };
     }
   }
 
-  async registerPrompts(server: McpServer, prefix = ''): Promise<void> {
-    const prompts = await this.listPrompts();
-    if (prompts.length === 0) return;
-
-    for (const prompt of prompts) {
-      const registeredName = prefix + prompt.name;
-      this.logger('info', `[${this.name}] Bundling prompt: ${registeredName}`);
-
-      // Build Zod raw shape from prompt arguments
-      const argShape: Record<string, z.ZodTypeAny> = {};
-      for (const arg of prompt.arguments ?? []) {
-        let field: z.ZodTypeAny = z.string();
-        if (arg.description) {
-          field = field.describe(arg.description);
-        }
-        if (!arg.required) {
-          field = field.optional();
-        }
-        argShape[arg.name] = field;
-      }
-
-      const originalName = prompt.name;
-
-      server.registerPrompt(
-        registeredName,
-        {
-          description: prompt.description,
-          argsSchema: Object.keys(argShape).length > 0 ? argShape : undefined,
-        },
-        async (args) => {
-          if (!this.client || this.state !== 'connected') {
-            return {
-              messages: [
-                {
-                  role: 'user' as const,
-                  content: {
-                    type: 'text' as const,
-                    text: `[${this.name}] Not connected — cannot get prompt ${originalName}`,
-                  },
-                },
-              ],
-            };
-          }
-          try {
-            const result = await this.client.getPrompt({
-              name: originalName,
-              arguments: args as Record<string, string>,
-            });
-            return result;
-          } catch (error) {
-            const msg = formatError(error);
-            this.logger(
-              'error',
-              `[${this.name}] Prompt call failed: ${originalName}`,
-              { error: msg },
-            );
-            return {
-              messages: [
-                {
-                  role: 'user' as const,
-                  content: {
-                    type: 'text' as const,
-                    text: `[${this.name}] ${originalName} failed: ${msg}`,
-                  },
-                },
-              ],
-            };
-          }
-        },
-      );
-
-      this.registeredPromptNames.add(registeredName);
+  async getPrompt(
+    name: string,
+    arguments_: Record<string, string> = {},
+  ): Promise<GetPromptResult> {
+    if (!this.client || this.state !== 'connected') {
+      return {
+        messages: [
+          {
+            role: 'user' as const,
+            content: {
+              type: 'text' as const,
+              text: `[${this.name}] Not connected — cannot get prompt ${name}`,
+            },
+          },
+        ],
+      };
     }
-  }
 
-  unregisterTools(server: McpServer): void {
-    const serverAny = server as unknown as {
-      _registeredTools: Record<string, { remove?: () => void }>;
-    };
-    if (!serverAny._registeredTools) return;
-
-    for (const name of this.registeredToolNames) {
-      const tool = serverAny._registeredTools[name];
-      if (tool?.remove) {
-        this.logger('info', `[${this.name}] Removing tool: ${name}`);
-        tool.remove();
-      }
+    try {
+      return await this.client.getPrompt({
+        name,
+        arguments: arguments_,
+      });
+    } catch (error) {
+      const msg = formatError(error);
+      this.logger('error', `[${this.name}] Prompt call failed: ${name}`, {
+        error: msg,
+      });
+      return {
+        messages: [
+          {
+            role: 'user' as const,
+            content: {
+              type: 'text' as const,
+              text: `[${this.name}] ${name} failed: ${msg}`,
+            },
+          },
+        ],
+      };
     }
-    this.registeredToolNames.clear();
-  }
-
-  unregisterResources(server: McpServer): void {
-    const serverAny = server as unknown as {
-      _registeredResources: Record<string, { remove?: () => void }>;
-    };
-    if (!serverAny._registeredResources) return;
-
-    for (const uri of this.registeredResourceUris) {
-      const resource = serverAny._registeredResources[uri];
-      if (resource?.remove) {
-        this.logger('info', `[${this.name}] Removing resource: ${uri}`);
-        resource.remove();
-      }
-    }
-    this.registeredResourceUris.clear();
-  }
-
-  unregisterPrompts(server: McpServer): void {
-    const serverAny = server as unknown as {
-      _registeredPrompts: Record<string, { remove?: () => void }>;
-    };
-    if (!serverAny._registeredPrompts) return;
-
-    for (const name of this.registeredPromptNames) {
-      const prompt = serverAny._registeredPrompts[name];
-      if (prompt?.remove) {
-        this.logger('info', `[${this.name}] Removing prompt: ${name}`);
-        prompt.remove();
-      }
-    }
-    this.registeredPromptNames.clear();
   }
 
   async close(): Promise<void> {
@@ -550,9 +446,9 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   private handleDisconnect(): void {
     this.state = 'disconnected';
     this.logger('info', `[${this.name}] Disconnected`);
-    this.lastToolNames = [];
-    this.lastResourceUris = [];
-    this.lastPromptNames = [];
+    this.lastTools = [];
+    this.lastResources = [];
+    this.lastPrompts = [];
     this.emit('disconnected');
     this.scheduleReconnect();
   }
@@ -595,3 +491,5 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     }, this.reconnectOpts.intervalMs);
   }
 }
+
+export * from './adapter.js';
