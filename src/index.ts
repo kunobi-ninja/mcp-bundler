@@ -57,6 +57,17 @@ function cloneDefinitions<T>(definitions: T[]): T[] {
   return definitions.map((definition) => structuredClone(definition));
 }
 
+/** Detect a 404 "session not found" HTTP error from the MCP SDK transport.
+ *  Uses duck-typing so the bundler works even if the consumer's SDK version
+ *  doesn't export StreamableHTTPError. */
+function isSessionExpiredError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    'code' in error &&
+    (error as { code: unknown }).code === 404
+  );
+}
+
 export class McpBundler extends EventEmitter<McpBundlerEvents> {
   public readonly name: string;
 
@@ -80,6 +91,9 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   private lastResources: Resource[] = [];
   private lastPrompts: Prompt[] = [];
   private closed = false;
+  private connectedAt: number | null = null;
+  private successfulCalls = 0;
+  private totalReconnects = 0;
 
   constructor(options: McpBundlerOptions) {
     super();
@@ -119,6 +133,20 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
 
   getPromptDefinitions(): Prompt[] {
     return cloneDefinitions(this.lastPrompts);
+  }
+
+  getDiagnostics(): {
+    connectedAt: number | null;
+    successfulCalls: number;
+    totalReconnects: number;
+    sessionUptimeMs: number | null;
+  } {
+    return {
+      connectedAt: this.connectedAt,
+      successfulCalls: this.successfulCalls,
+      totalReconnects: this.totalReconnects,
+      sessionUptimeMs: this.connectedAt ? Date.now() - this.connectedAt : null,
+    };
   }
 
   async reconnectNow(): Promise<void> {
@@ -219,6 +247,17 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
           this.logger('error', `[${this.name}] Transport error`, {
             error: formatError(error),
           });
+          if (
+            isSessionExpiredError(error) &&
+            this.state === 'connected'
+          ) {
+            const diag = this.getDiagnostics();
+            this.logger(
+              'warn',
+              `[${this.name}] Session expired (uptime: ${diag.sessionUptimeMs ?? 0}ms, calls: ${diag.successfulCalls}). Reconnecting.`,
+            );
+            this.handleDisconnect();
+          }
         };
         this.activeTransport = httpTransport;
       } else {
@@ -248,6 +287,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       await this.client.connect(this.activeTransport);
 
       this.state = 'connected';
+      this.connectedAt = Date.now();
       this.retryCount = 0;
       this.logger('info', `[${this.name}] Connected`);
 
@@ -322,7 +362,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
         content: [
           {
             type: 'text' as const,
-            text: `[${this.name}] Not connected — cannot call ${name}`,
+            text: `[${this.name}] Not connected — cannot call ${name}. Automatic reconnect in progress — retry shortly or call kunobi_status.`,
           },
         ],
         isError: true,
@@ -330,11 +370,49 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     }
 
     try {
-      return (await this.client.callTool({
+      const result = (await this.client.callTool({
         name,
         arguments: arguments_,
       })) as CallToolResult;
+      this.successfulCalls++;
+      return result;
     } catch (error) {
+      if (isSessionExpiredError(error)) {
+        const diag = this.getDiagnostics();
+        this.logger(
+          'warn',
+          `[${this.name}] Session expired during ${name} (uptime: ${diag.sessionUptimeMs ?? 0}ms, calls: ${diag.successfulCalls}). Attempting reconnect + retry.`,
+        );
+
+        await this.reconnectNow();
+
+        if (this.client && this.state === 'connected') {
+          try {
+            const retryResult = (await this.client.callTool({
+              name,
+              arguments: arguments_,
+            })) as CallToolResult;
+            this.successfulCalls++;
+            return retryResult;
+          } catch (retryError) {
+            const retryMsg = formatError(retryError);
+            this.logger('error', `[${this.name}] Retry failed for ${name}`, {
+              error: retryMsg,
+            });
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `[${this.name}] Session expired after ${Math.round((diag.sessionUptimeMs ?? 0) / 1000)}s (${diag.successfulCalls} successful calls). Reconnect + retry failed. Automatic reconnect in progress — retry shortly or call kunobi_status to check connectivity.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
       const msg = formatError(error);
       this.logger('error', `[${this.name}] Tool call failed: ${name}`, {
         error: msg,
@@ -444,6 +522,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   }
 
   private handleDisconnect(): void {
+    this.connectedAt = null;
     this.state = 'disconnected';
     this.logger('info', `[${this.name}] Disconnected`);
     this.lastTools = [];
@@ -456,7 +535,6 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   private scheduleReconnect(): void {
     if (this.closed) return;
     if (!this.reconnectOpts.enabled) return;
-    // Skip reconnect for stdio — process lifecycle is managed by the transport
     if (this.transportConfig.type === 'stdio') return;
     if (this.retryCount >= this.reconnectOpts.maxRetries) {
       this.logger(
@@ -467,16 +545,22 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     }
 
     this.retryCount++;
+    this.totalReconnects++;
+
+    const delay = Math.min(
+      this.reconnectOpts.intervalMs * 1.5 ** (this.retryCount - 1),
+      60_000,
+    );
+
     this.logger(
       'info',
-      `[${this.name}] Reconnecting in ${this.reconnectOpts.intervalMs}ms (attempt ${this.retryCount})`,
+      `[${this.name}] Reconnecting in ${delay}ms (attempt ${this.retryCount})`,
     );
 
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
       this.state = 'idle';
 
-      // Clean up old client
       if (this.client) {
         try {
           await this.client.close();
@@ -488,7 +572,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       }
 
       await this.connect();
-    }, this.reconnectOpts.intervalMs);
+    }, delay);
   }
 }
 

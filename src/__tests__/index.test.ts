@@ -4,7 +4,7 @@ import type {
   Resource,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { formatError, McpBundler, McpBundlerServerAdapter } from '../index.js';
 
 type ServerInternals = {
@@ -386,5 +386,256 @@ describe('McpBundlerServerAdapter', () => {
     expect(adapterAny.registeredToolNames.size).toBe(0);
     expect(adapterAny.registeredResourceUris.size).toBe(0);
     expect(adapterAny.registeredPromptNames.size).toBe(0);
+  });
+});
+
+describe('diagnostics', () => {
+  it('initializes diagnostic fields to zero/null', () => {
+    const bundler = createBundler();
+    expect(bundler.getDiagnostics()).toEqual({
+      connectedAt: null,
+      successfulCalls: 0,
+      totalReconnects: 0,
+      sessionUptimeMs: null,
+    });
+  });
+});
+
+describe('session error detection', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('can import and detect StreamableHTTPError with code 404', async () => {
+    const { StreamableHTTPError } = await import(
+      '@modelcontextprotocol/sdk/client/streamableHttp.js'
+    );
+    const sessionError = new StreamableHTTPError(404, 'Session not found');
+    expect(sessionError).toBeInstanceOf(StreamableHTTPError);
+    expect(sessionError.code).toBe(404);
+  });
+
+  it('does not treat non-404 errors as session errors', async () => {
+    const { StreamableHTTPError } = await import(
+      '@modelcontextprotocol/sdk/client/streamableHttp.js'
+    );
+    const serverError = new StreamableHTTPError(500, 'Internal Server Error');
+    expect(serverError.code).toBe(500);
+  });
+
+  it('detects session errors via duck-typing (no StreamableHTTPError import needed)', async () => {
+    // Simulate an error from an older SDK that has a code property but isn't StreamableHTTPError
+    class OldSdkHttpError extends Error {
+      code: number;
+      constructor(code: number, message: string) {
+        super(message);
+        this.code = code;
+      }
+    }
+    const bundler = new McpBundler({
+      name: 'duck-type-test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+
+    const bundlerAny = bundler as unknown as {
+      client: { callTool: ReturnType<typeof vi.fn> };
+      state: string;
+    };
+
+    bundlerAny.client = {
+      callTool: vi.fn().mockRejectedValue(new OldSdkHttpError(404, 'Session not found')),
+    };
+    bundlerAny.state = 'connected';
+
+    vi.spyOn(bundler, 'reconnectNow').mockImplementation(async () => {
+      bundlerAny.state = 'disconnected';
+    });
+
+    const result = await bundler.callTool('test-tool');
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Session expired');
+  });
+});
+
+describe('callTool session retry', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('retries once on 404 and returns success if reconnect succeeds', async () => {
+    const { StreamableHTTPError } = await import(
+      '@modelcontextprotocol/sdk/client/streamableHttp.js'
+    );
+
+    const bundler = new McpBundler({
+      name: 'retry-test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+
+    const bundlerAny = bundler as unknown as {
+      client: { callTool: ReturnType<typeof vi.fn> };
+      state: string;
+    };
+
+    bundlerAny.state = 'connected';
+    bundlerAny.client = {
+      callTool: vi
+        .fn()
+        .mockRejectedValueOnce(
+          new StreamableHTTPError(404, 'Session not found'),
+        ),
+    };
+
+    vi.spyOn(bundler, 'reconnectNow').mockImplementation(async () => {
+      bundlerAny.state = 'connected';
+      bundlerAny.client = {
+        callTool: vi.fn().mockResolvedValue({
+          content: [{ type: 'text', text: 'success after retry' }],
+        }),
+      };
+    });
+
+    const result = await bundler.callTool('test-tool', { action: 'list' });
+    expect(result.content[0].text).toBe('success after retry');
+  });
+
+  it('returns diagnostic error message when retry fails', async () => {
+    const { StreamableHTTPError } = await import(
+      '@modelcontextprotocol/sdk/client/streamableHttp.js'
+    );
+
+    const bundler = new McpBundler({
+      name: 'retry-fail-test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+
+    const bundlerAny = bundler as unknown as {
+      client: { callTool: ReturnType<typeof vi.fn> };
+      state: string;
+    };
+
+    bundlerAny.client = {
+      callTool: vi
+        .fn()
+        .mockRejectedValue(new StreamableHTTPError(404, 'Session not found')),
+    };
+    bundlerAny.state = 'connected';
+
+    vi.spyOn(bundler, 'reconnectNow').mockImplementation(async () => {
+      bundlerAny.state = 'disconnected';
+      bundlerAny.client = null as unknown as typeof bundlerAny.client;
+    });
+
+    const result = await bundler.callTool('test-tool', { action: 'list' });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Session expired');
+    expect(result.content[0].text).toContain('kunobi_status');
+  });
+
+  it('does not retry on non-404 errors', async () => {
+    const bundler = createBundler();
+    const bundlerAny = bundler as unknown as {
+      client: { callTool: ReturnType<typeof vi.fn> };
+      state: string;
+    };
+
+    bundlerAny.client = {
+      callTool: vi.fn().mockRejectedValue(new Error('Network error')),
+    };
+    bundlerAny.state = 'connected';
+
+    const reconnectSpy = vi.spyOn(bundler, 'reconnectNow');
+    const result = await bundler.callTool('test-tool');
+
+    expect(result.isError).toBe(true);
+    expect(reconnectSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('exponential backoff', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('increases delay with each retry attempt', async () => {
+    const logMessages: string[] = [];
+    const bundler = new McpBundler({
+      name: 'backoff-test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: true, intervalMs: 1000, maxRetries: 10 },
+      logger: (_level, message) => logMessages.push(message),
+    });
+
+    // First connect fails fast, schedules attempt 1
+    await bundler.connect();
+    expect(bundler.getState()).toBe('disconnected');
+
+    const attempt1Log = logMessages.find((m) => m.includes('attempt 1'));
+    expect(attempt1Log).toContain('1000ms');
+
+    // Stub connect so the retry completes instantly (fails fast) and schedules attempt 2
+    vi.spyOn(bundler, 'connect').mockImplementation(async () => {
+      const bundlerAny = bundler as unknown as {
+        state: string;
+        scheduleReconnect: () => void;
+      };
+      bundlerAny.state = 'disconnected';
+      bundlerAny.scheduleReconnect();
+    });
+
+    // Fire attempt 1 timer
+    await vi.advanceTimersByTimeAsync(1100);
+
+    const attempt2Log = logMessages.find((m) => m.includes('attempt 2'));
+    expect(attempt2Log).toBeDefined();
+    expect(attempt2Log).toContain('1500ms');
+
+    await bundler.close();
+  });
+
+  it('caps delay at 60 seconds', async () => {
+    const logMessages: string[] = [];
+    const bundler = new McpBundler({
+      name: 'cap-test',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: true, intervalMs: 50000, maxRetries: 10 },
+      logger: (_level, message) => logMessages.push(message),
+    });
+
+    // First connect fails, schedules attempt 1
+    await bundler.connect();
+
+    const attempt1Log = logMessages.find((m) => m.includes('attempt 1'));
+    expect(attempt1Log).toContain('50000ms');
+
+    // Stub connect so attempt 1 completes fast and schedules attempt 2
+    vi.spyOn(bundler, 'connect').mockImplementation(async () => {
+      const bundlerAny = bundler as unknown as {
+        state: string;
+        scheduleReconnect: () => void;
+      };
+      bundlerAny.state = 'disconnected';
+      bundlerAny.scheduleReconnect();
+    });
+
+    // Fire attempt 1 timer
+    await vi.advanceTimersByTimeAsync(51000);
+
+    const attempt2Log = logMessages.find((m) => m.includes('attempt 2'));
+    expect(attempt2Log).toBeDefined();
+    expect(attempt2Log).toContain('60000ms');
+
+    await bundler.close();
   });
 });
