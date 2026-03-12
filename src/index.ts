@@ -247,10 +247,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
           this.logger('error', `[${this.name}] Transport error`, {
             error: formatError(error),
           });
-          if (
-            isSessionExpiredError(error) &&
-            this.state === 'connected'
-          ) {
+          if (isSessionExpiredError(error) && this.state === 'connected') {
             const diag = this.getDiagnostics();
             this.logger(
               'warn',

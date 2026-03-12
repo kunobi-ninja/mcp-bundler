@@ -445,7 +445,9 @@ describe('session error detection', () => {
     };
 
     bundlerAny.client = {
-      callTool: vi.fn().mockRejectedValue(new OldSdkHttpError(404, 'Session not found')),
+      callTool: vi
+        .fn()
+        .mockRejectedValue(new OldSdkHttpError(404, 'Session not found')),
     };
     bundlerAny.state = 'connected';
 
