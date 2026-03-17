@@ -1,6 +1,6 @@
 # @kunobi/mcp-bundler
 
-Connect to a remote MCP server and cache its tools, resources, and prompts locally. The core `McpBundler` is transport-agnostic and only handles connection lifecycle, metadata refresh, and direct forwarding. An optional `McpBundlerServerAdapter` can re-export that remote metadata onto a local `McpServer`.
+Connect to a remote MCP server and cache its tools, resources, and prompts locally. The core `McpBundler` is transport-agnostic and handles connection lifecycle, metadata refresh, and reconnect-aware forwarding. An optional `McpBundlerServerAdapter` can re-export that remote metadata onto a local `McpServer`.
 
 ## Install
 
@@ -60,6 +60,8 @@ bundler.on('prompts_changed', async () => {
 
 await bundler.connect();
 ```
+
+A stable proxy can keep the last-known registrations visible during short downstream disconnects and rely on `callTool` / `readResource` / `getPrompt` to reconnect on demand. If you want longer-lived surfaces, debounce unregisters in your adapter layer instead of removing everything on the first transport drop.
 
 ## API
 
