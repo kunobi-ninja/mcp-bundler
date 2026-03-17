@@ -21,6 +21,7 @@ export interface ReconnectOptions {
   enabled: boolean;
   intervalMs: number;
   maxRetries: number;
+  operationTimeoutMs: number;
 }
 
 export type McpTransportConfig =
@@ -45,6 +46,11 @@ export interface McpBundlerEvents {
   tools_changed: [tools: Tool[]];
   resources_changed: [resources: Resource[]];
   prompts_changed: [prompts: Prompt[]];
+}
+
+interface ConnectionWaiter {
+  resolve: (connected: boolean) => void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 export function formatError(error: unknown): string {
@@ -94,6 +100,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   private connectedAt: number | null = null;
   private successfulCalls = 0;
   private totalReconnects = 0;
+  private connectionWaiters = new Set<ConnectionWaiter>();
 
   constructor(options: McpBundlerOptions) {
     super();
@@ -104,6 +111,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       enabled: options.reconnect?.enabled ?? true,
       intervalMs: options.reconnect?.intervalMs ?? 5_000,
       maxRetries: options.reconnect?.maxRetries ?? Number.POSITIVE_INFINITY,
+      operationTimeoutMs: options.reconnect?.operationTimeoutMs ?? 2_000,
     };
   }
 
@@ -147,6 +155,58 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       totalReconnects: this.totalReconnects,
       sessionUptimeMs: this.connectedAt ? Date.now() - this.connectedAt : null,
     };
+  }
+
+  private resolveConnectionWaiters(connected: boolean): void {
+    for (const waiter of this.connectionWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(connected);
+    }
+    this.connectionWaiters.clear();
+  }
+
+  private waitForConnected(timeoutMs: number): Promise<boolean> {
+    if (this.client && this.state === 'connected') {
+      return Promise.resolve(true);
+    }
+    if (this.closed) {
+      return Promise.resolve(false);
+    }
+
+    return new Promise((resolve) => {
+      const waiter: ConnectionWaiter = {
+        resolve,
+        timer: setTimeout(() => {
+          this.connectionWaiters.delete(waiter);
+          resolve(this.client !== null && this.state === 'connected');
+        }, timeoutMs),
+      };
+      this.connectionWaiters.add(waiter);
+    });
+  }
+
+  private async ensureConnected(
+    timeoutMs = this.reconnectOpts.operationTimeoutMs,
+  ): Promise<boolean> {
+    if (this.client && this.state === 'connected') {
+      return true;
+    }
+
+    if (this.state === 'connecting') {
+      return this.waitForConnected(timeoutMs);
+    }
+
+    if (this.state === 'idle' || this.state === 'disconnected') {
+      await this.reconnectNow();
+      if (this.client && this.getState() === 'connected') {
+        return true;
+      }
+      if (this.getState() === 'connecting') {
+        return this.waitForConnected(timeoutMs);
+      }
+    }
+
+    return this.client !== null && this.state === 'connected';
   }
 
   async reconnectNow(): Promise<void> {
@@ -286,6 +346,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       this.state = 'connected';
       this.connectedAt = Date.now();
       this.retryCount = 0;
+      this.resolveConnectionWaiters(true);
       this.logger('info', `[${this.name}] Connected`);
 
       await this.listTools();
@@ -298,6 +359,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
         error: formatError(error),
       });
       this.state = 'disconnected';
+      this.resolveConnectionWaiters(false);
       this.scheduleReconnect();
     }
   }
@@ -354,7 +416,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   ): Promise<CallToolResult> {
     this.logger('info', `[${this.name}] Forwarding call: ${name}`);
 
-    if (!this.client || this.state !== 'connected') {
+    if (!(await this.ensureConnected())) {
       return {
         content: [
           {
@@ -367,7 +429,7 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     }
 
     try {
-      const result = (await this.client.callTool({
+      const result = (await this.client?.callTool({
         name,
         arguments: arguments_,
       })) as CallToolResult;
@@ -383,9 +445,9 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
 
         await this.reconnectNow();
 
-        if (this.client && this.state === 'connected') {
+        if (await this.ensureConnected()) {
           try {
-            const retryResult = (await this.client.callTool({
+            const retryResult = (await this.client?.callTool({
               name,
               arguments: arguments_,
             })) as CallToolResult;
@@ -427,7 +489,19 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
   }
 
   async readResource(uri: string): Promise<ReadResourceResult> {
-    if (!this.client || this.state !== 'connected') {
+    if (!(await this.ensureConnected())) {
+      return {
+        contents: [
+          {
+            uri,
+            text: `[${this.name}] Not connected — cannot read ${uri}`,
+          },
+        ],
+      };
+    }
+
+    const client = this.client;
+    if (!client) {
       return {
         contents: [
           {
@@ -439,8 +513,33 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     }
 
     try {
-      return await this.client.readResource({ uri });
+      return await client.readResource({ uri });
     } catch (error) {
+      if (isSessionExpiredError(error)) {
+        this.logger(
+          'warn',
+          `[${this.name}] Session expired while reading ${uri}`,
+        );
+        await this.reconnectNow();
+        if (await this.ensureConnected()) {
+          const retryClient = this.client;
+          try {
+            if (retryClient) {
+              return await retryClient.readResource({ uri });
+            }
+          } catch (retryError) {
+            const retryMsg = formatError(retryError);
+            this.logger(
+              'error',
+              `[${this.name}] Resource retry failed: ${uri}`,
+              {
+                error: retryMsg,
+              },
+            );
+          }
+        }
+      }
+
       const msg = formatError(error);
       this.logger('error', `[${this.name}] Resource read failed: ${uri}`, {
         error: msg,
@@ -460,7 +559,22 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     name: string,
     arguments_: Record<string, string> = {},
   ): Promise<GetPromptResult> {
-    if (!this.client || this.state !== 'connected') {
+    if (!(await this.ensureConnected())) {
+      return {
+        messages: [
+          {
+            role: 'user' as const,
+            content: {
+              type: 'text' as const,
+              text: `[${this.name}] Not connected — cannot get prompt ${name}`,
+            },
+          },
+        ],
+      };
+    }
+
+    const client = this.client;
+    if (!client) {
       return {
         messages: [
           {
@@ -475,11 +589,39 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     }
 
     try {
-      return await this.client.getPrompt({
+      return await client.getPrompt({
         name,
         arguments: arguments_,
       });
     } catch (error) {
+      if (isSessionExpiredError(error)) {
+        this.logger(
+          'warn',
+          `[${this.name}] Session expired while getting prompt ${name}`,
+        );
+        await this.reconnectNow();
+        if (await this.ensureConnected()) {
+          const retryClient = this.client;
+          try {
+            if (retryClient) {
+              return await retryClient.getPrompt({
+                name,
+                arguments: arguments_,
+              });
+            }
+          } catch (retryError) {
+            const retryMsg = formatError(retryError);
+            this.logger(
+              'error',
+              `[${this.name}] Prompt retry failed: ${name}`,
+              {
+                error: retryMsg,
+              },
+            );
+          }
+        }
+      }
+
       const msg = formatError(error);
       this.logger('error', `[${this.name}] Prompt call failed: ${name}`, {
         error: msg,
@@ -516,15 +658,13 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
     }
     this.activeTransport = null;
     this.state = 'idle';
+    this.resolveConnectionWaiters(false);
   }
 
   private handleDisconnect(): void {
     this.connectedAt = null;
     this.state = 'disconnected';
     this.logger('info', `[${this.name}] Disconnected`);
-    this.lastTools = [];
-    this.lastResources = [];
-    this.lastPrompts = [];
     this.emit('disconnected');
     this.scheduleReconnect();
   }

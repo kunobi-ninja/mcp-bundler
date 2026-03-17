@@ -641,3 +641,115 @@ describe('exponential backoff', () => {
     await bundler.close();
   });
 });
+
+describe('stable reconnect behavior', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('preserves cached metadata across disconnects', () => {
+    const bundler = createBundler();
+    const bundlerAny = bundler as unknown as {
+      handleDisconnect: () => void;
+      lastPrompts: Array<{ name: string; arguments: Array<{ name: string }> }>;
+      lastResources: Array<{ uri: string; name: string }>;
+      lastTools: Array<{ name: string; inputSchema: { type: string } }>;
+      state: string;
+    };
+
+    bundlerAny.state = 'connected';
+    bundlerAny.lastTools = [{ name: 'k8s', inputSchema: { type: 'object' } }];
+    bundlerAny.lastResources = [{ uri: 'kunobi://status', name: 'status' }];
+    bundlerAny.lastPrompts = [
+      { name: 'setup', arguments: [{ name: 'cluster' }] },
+    ];
+
+    bundlerAny.handleDisconnect();
+
+    expect(bundler.getState()).toBe('disconnected');
+    expect(bundler.getTools()).toEqual(['k8s']);
+    expect(bundler.getResources()).toEqual(['kunobi://status']);
+    expect(bundler.getPrompts()).toEqual(['setup']);
+  });
+
+  it('reconnects on demand for tool calls while disconnected', async () => {
+    const bundler = createBundler();
+    const bundlerAny = bundler as unknown as {
+      client: { callTool: ReturnType<typeof vi.fn> };
+      state: string;
+    };
+
+    bundlerAny.state = 'disconnected';
+    const reconnectSpy = vi
+      .spyOn(bundler, 'reconnectNow')
+      .mockImplementation(async () => {
+        bundlerAny.state = 'connected';
+        bundlerAny.client = {
+          callTool: vi.fn().mockResolvedValue({
+            content: [{ type: 'text', text: 'recovered tool call' }],
+          }),
+        };
+      });
+
+    const result = await bundler.callTool('k8s', { action: 'list' });
+
+    expect(reconnectSpy).toHaveBeenCalledOnce();
+    expect(result.content[0].text).toBe('recovered tool call');
+  });
+
+  it('reconnects on demand for resource reads while disconnected', async () => {
+    const bundler = createBundler();
+    const bundlerAny = bundler as unknown as {
+      client: { readResource: ReturnType<typeof vi.fn> };
+      state: string;
+    };
+
+    bundlerAny.state = 'disconnected';
+    const reconnectSpy = vi
+      .spyOn(bundler, 'reconnectNow')
+      .mockImplementation(async () => {
+        bundlerAny.state = 'connected';
+        bundlerAny.client = {
+          readResource: vi.fn().mockResolvedValue({
+            contents: [{ uri: 'kunobi://status', text: 'resource payload' }],
+          }),
+        };
+      });
+
+    const result = await bundler.readResource('kunobi://status');
+
+    expect(reconnectSpy).toHaveBeenCalledOnce();
+    expect(result.contents[0].text).toBe('resource payload');
+  });
+
+  it('reconnects on demand for prompt requests while disconnected', async () => {
+    const bundler = createBundler();
+    const bundlerAny = bundler as unknown as {
+      client: { getPrompt: ReturnType<typeof vi.fn> };
+      state: string;
+    };
+
+    bundlerAny.state = 'disconnected';
+    const reconnectSpy = vi
+      .spyOn(bundler, 'reconnectNow')
+      .mockImplementation(async () => {
+        bundlerAny.state = 'connected';
+        bundlerAny.client = {
+          getPrompt: vi.fn().mockResolvedValue({
+            messages: [
+              {
+                role: 'user',
+                content: { type: 'text', text: 'prompt payload' },
+              },
+            ],
+          }),
+        };
+      });
+
+    const result = await bundler.getPrompt('setup');
+
+    expect(reconnectSpy).toHaveBeenCalledOnce();
+    expect(result.messages[0].content.type).toBe('text');
+    expect(result.messages[0].content.text).toBe('prompt payload');
+  });
+});
