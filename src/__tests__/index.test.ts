@@ -642,7 +642,6 @@ describe('exponential backoff', () => {
   });
 });
 
-
 describe('stable reconnect behavior', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -681,14 +680,16 @@ describe('stable reconnect behavior', () => {
     };
 
     bundlerAny.state = 'disconnected';
-    const reconnectSpy = vi.spyOn(bundler, 'reconnectNow').mockImplementation(async () => {
-      bundlerAny.state = 'connected';
-      bundlerAny.client = {
-        callTool: vi.fn().mockResolvedValue({
-          content: [{ type: 'text', text: 'recovered tool call' }],
-        }),
-      };
-    });
+    const reconnectSpy = vi
+      .spyOn(bundler, 'reconnectNow')
+      .mockImplementation(async () => {
+        bundlerAny.state = 'connected';
+        bundlerAny.client = {
+          callTool: vi.fn().mockResolvedValue({
+            content: [{ type: 'text', text: 'recovered tool call' }],
+          }),
+        };
+      });
 
     const result = await bundler.callTool('k8s', { action: 'list' });
 
@@ -704,14 +705,16 @@ describe('stable reconnect behavior', () => {
     };
 
     bundlerAny.state = 'disconnected';
-    const reconnectSpy = vi.spyOn(bundler, 'reconnectNow').mockImplementation(async () => {
-      bundlerAny.state = 'connected';
-      bundlerAny.client = {
-        readResource: vi.fn().mockResolvedValue({
-          contents: [{ uri: 'kunobi://status', text: 'resource payload' }],
-        }),
-      };
-    });
+    const reconnectSpy = vi
+      .spyOn(bundler, 'reconnectNow')
+      .mockImplementation(async () => {
+        bundlerAny.state = 'connected';
+        bundlerAny.client = {
+          readResource: vi.fn().mockResolvedValue({
+            contents: [{ uri: 'kunobi://status', text: 'resource payload' }],
+          }),
+        };
+      });
 
     const result = await bundler.readResource('kunobi://status');
 
@@ -727,19 +730,21 @@ describe('stable reconnect behavior', () => {
     };
 
     bundlerAny.state = 'disconnected';
-    const reconnectSpy = vi.spyOn(bundler, 'reconnectNow').mockImplementation(async () => {
-      bundlerAny.state = 'connected';
-      bundlerAny.client = {
-        getPrompt: vi.fn().mockResolvedValue({
-          messages: [
-            {
-              role: 'user',
-              content: { type: 'text', text: 'prompt payload' },
-            },
-          ],
-        }),
-      };
-    });
+    const reconnectSpy = vi
+      .spyOn(bundler, 'reconnectNow')
+      .mockImplementation(async () => {
+        bundlerAny.state = 'connected';
+        bundlerAny.client = {
+          getPrompt: vi.fn().mockResolvedValue({
+            messages: [
+              {
+                role: 'user',
+                content: { type: 'text', text: 'prompt payload' },
+              },
+            ],
+          }),
+        };
+      });
 
     const result = await bundler.getPrompt('setup');
 

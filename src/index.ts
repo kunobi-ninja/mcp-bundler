@@ -500,20 +500,42 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       };
     }
 
+    const client = this.client;
+    if (!client) {
+      return {
+        contents: [
+          {
+            uri,
+            text: `[${this.name}] Not connected — cannot read ${uri}`,
+          },
+        ],
+      };
+    }
+
     try {
-      return await this.client!.readResource({ uri });
+      return await client.readResource({ uri });
     } catch (error) {
       if (isSessionExpiredError(error)) {
-        this.logger('warn', `[${this.name}] Session expired while reading ${uri}`);
+        this.logger(
+          'warn',
+          `[${this.name}] Session expired while reading ${uri}`,
+        );
         await this.reconnectNow();
         if (await this.ensureConnected()) {
+          const retryClient = this.client;
           try {
-            return await this.client!.readResource({ uri });
+            if (retryClient) {
+              return await retryClient.readResource({ uri });
+            }
           } catch (retryError) {
             const retryMsg = formatError(retryError);
-            this.logger('error', `[${this.name}] Resource retry failed: ${uri}`, {
-              error: retryMsg,
-            });
+            this.logger(
+              'error',
+              `[${this.name}] Resource retry failed: ${uri}`,
+              {
+                error: retryMsg,
+              },
+            );
           }
         }
       }
@@ -551,26 +573,51 @@ export class McpBundler extends EventEmitter<McpBundlerEvents> {
       };
     }
 
+    const client = this.client;
+    if (!client) {
+      return {
+        messages: [
+          {
+            role: 'user' as const,
+            content: {
+              type: 'text' as const,
+              text: `[${this.name}] Not connected — cannot get prompt ${name}`,
+            },
+          },
+        ],
+      };
+    }
+
     try {
-      return await this.client!.getPrompt({
+      return await client.getPrompt({
         name,
         arguments: arguments_,
       });
     } catch (error) {
       if (isSessionExpiredError(error)) {
-        this.logger('warn', `[${this.name}] Session expired while getting prompt ${name}`);
+        this.logger(
+          'warn',
+          `[${this.name}] Session expired while getting prompt ${name}`,
+        );
         await this.reconnectNow();
         if (await this.ensureConnected()) {
+          const retryClient = this.client;
           try {
-            return await this.client!.getPrompt({
-              name,
-              arguments: arguments_,
-            });
+            if (retryClient) {
+              return await retryClient.getPrompt({
+                name,
+                arguments: arguments_,
+              });
+            }
           } catch (retryError) {
             const retryMsg = formatError(retryError);
-            this.logger('error', `[${this.name}] Prompt retry failed: ${name}`, {
-              error: retryMsg,
-            });
+            this.logger(
+              'error',
+              `[${this.name}] Prompt retry failed: ${name}`,
+              {
+                error: retryMsg,
+              },
+            );
           }
         }
       }
