@@ -47,6 +47,8 @@ type JsonSchemaNode = {
   items?: JsonSchemaNode;
   properties?: Record<string, JsonSchemaNode>;
   required?: string[];
+  /** OpenAPI 3.0 nullability (older schemars / OpenAPI-derived schemas). */
+  nullable?: boolean;
 };
 
 /**
@@ -81,10 +83,14 @@ function zodForType(type: string, node: JsonSchemaNode): z.ZodTypeAny {
     case 'string':
       return z.string();
     case 'integer':
-      // `.int()` serializes back to JSON Schema as `type: "integer"`, keeping
-      // the advertised schema faithful to the downstream contract.
-      return z.number().int();
     case 'number':
+      // Map BOTH to `z.number()` — deliberately NOT `z.number().int()`. Under
+      // zod 4, `.int()` enforces `Number.isSafeInteger`, so it would reject a
+      // `uint64`/`int64` value above 2^53 that the downstream (a Rust u64)
+      // accepts and that the old `z.any()` mapping passed through — a
+      // regression on a real schemars shape (`{type:["integer","null"],
+      // format:"uint64"}`). A plain number still fixes the core bug (a scalar
+      // is advertised as a number, not stringified) without that ceiling.
       return z.number();
     case 'boolean':
       return z.boolean();
@@ -100,16 +106,40 @@ function zodForType(type: string, node: JsonSchemaNode): z.ZodTypeAny {
   }
 }
 
+/** A node is nullable if `null` is a `type` member or `nullable: true` (OpenAPI). */
+function nodeIsNullable(node: JsonSchemaNode): boolean {
+  if (node.nullable === true) return true;
+  return Array.isArray(node.type) && node.type.includes('null');
+}
+
 function jsonNodeToZod(node: JsonSchemaNode | undefined): z.ZodTypeAny {
   if (!node || typeof node !== 'object') {
     return z.any();
   }
 
-  // An explicit enum is the tightest constraint; honor it before `type`.
+  // An explicit enum is the tightest constraint; honor it before `type` — but
+  // only when every member is a primitive `z.literal` can match. `z.literal`
+  // compares non-primitives by reference, so an object/array-valued enum member
+  // could never match a structurally-equal input; stay permissive there rather
+  // than reject a valid value (the old `z.any()` accepted it).
   if (Array.isArray(node.enum) && node.enum.length > 0) {
-    return zodUnion(
+    const isPrimitive = (v: unknown) =>
+      v === null ||
+      typeof v === 'string' ||
+      typeof v === 'number' ||
+      typeof v === 'boolean';
+    if (!node.enum.every(isPrimitive)) {
+      return z.any();
+    }
+    const en = zodUnion(
       node.enum.map((v) => z.literal(v as Parameters<typeof z.literal>[0])),
     );
+    // Respect nullability declared alongside the enum (e.g. a nullable enum
+    // encoded as `{type:["string","null"],enum:[...]}` — the enum list omits
+    // null, so the `null` type member must not be silently dropped).
+    return nodeIsNullable(node) && !node.enum.includes(null)
+      ? en.nullable()
+      : en;
   }
 
   // JSON Schema allows `type` to be an array (a union) — and schemars encodes
@@ -121,7 +151,9 @@ function jsonNodeToZod(node: JsonSchemaNode | undefined): z.ZodTypeAny {
     return zodUnion(node.type.map((t) => zodForType(t, node)));
   }
   if (typeof node.type === 'string') {
-    return zodForType(node.type, node);
+    const mapped = zodForType(node.type, node);
+    // OpenAPI-style nullable (`{type:"string",nullable:true}`) — accept null too.
+    return node.nullable === true ? mapped.nullable() : mapped;
   }
 
   // No `type` (anyOf / oneOf / $ref / allOf / untyped): stay permissive. The

@@ -93,7 +93,11 @@ describe('e2e: proxied tool advertises real types and forwards them intact', () 
     // The core assertion: types survived to the advertised schema. Under the
     // old z.any() mapping these were all `{}` (no type), which is what let the
     // client stringify scalars.
-    expect(props?.port?.type).toBe('integer'); // faithful (not just "number")
+    // A real numeric type survives (the core fix) — `number`, not the old
+    // typeless `{}`. Deliberately NOT `integer`: mapping integer→z.number()
+    // (rather than z.number().int()) is what avoids the uint64 regression, at
+    // the cost of the nominal integer keyword. Downstream still enforces uint*.
+    expect(props?.port?.type).toBe('number');
     expect(props?.auto_start?.type).toBe('boolean');
     expect(props?.provider_ids?.type).toBe('array');
     expect((props?.provider_ids?.items as { type?: unknown })?.type).toBe(
