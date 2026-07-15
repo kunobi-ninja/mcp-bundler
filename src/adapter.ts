@@ -170,8 +170,10 @@ function enumBaseType(node: JsonSchemaNode): string | undefined {
   const members = (node.enum ?? []).filter((v) => v !== null);
   if (members.length === 0) return undefined;
   const t = typeof members[0];
-  if ((t === 'string' || t === 'number' || t === 'boolean') &&
-    members.every((v) => typeof v === t)) {
+  if (
+    (t === 'string' || t === 'number' || t === 'boolean') &&
+    members.every((v) => typeof v === t)
+  ) {
     return t;
   }
   return undefined; // mixed / object / array members → permissive

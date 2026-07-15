@@ -19,7 +19,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { McpBundler, McpBundlerServerAdapter } from '../dist/index.js';
 
 const url = process.argv[2] ?? 'http://127.0.0.1:3500/mcp';
-const TYPED = /"type":\s*"(number|integer|boolean|array|object)"|"anyOf"|"const"/;
+const TYPED =
+  /"type":\s*"(number|integer|boolean|array|object)"|"anyOf"|"const"/;
 
 const bundler = new McpBundler({
   name: 'smoke',
@@ -35,8 +36,13 @@ if (!live.length) {
 }
 console.log(`Connected to ${url} — ${live.length} downstream tools.`);
 
-const server = new McpServer({ name: 'hub', version: '0' }, { capabilities: { tools: { listChanged: true } } });
-await new McpBundlerServerAdapter(bundler, { toolPrefix: 'x__' }).registerTools(server);
+const server = new McpServer(
+  { name: 'hub', version: '0' },
+  { capabilities: { tools: { listChanged: true } } },
+);
+await new McpBundlerServerAdapter(bundler, { toolPrefix: 'x__' }).registerTools(
+  server,
+);
 const client = new Client({ name: 'smoke', version: '0' });
 const [ct, st] = InMemoryTransport.createLinkedPair();
 await Promise.all([server.server.connect(st), client.connect(ct)]);
@@ -46,14 +52,20 @@ let typedTools = 0;
 let typedParams = 0;
 for (const t of tools) {
   const props = t.inputSchema?.properties ?? {};
-  const typed = Object.entries(props).filter(([, v]) => TYPED.test(JSON.stringify(v)));
+  const typed = Object.entries(props).filter(([, v]) =>
+    TYPED.test(JSON.stringify(v)),
+  );
   if (typed.length) {
     typedTools++;
     typedParams += typed.length;
   }
 }
-console.log(`Re-exposed ${tools.length} tools; ${typedTools} carry typed params (${typedParams} params total).`);
-console.log('Under the old z.any() mapping every one of these would be advertised as {} (typeless).');
+console.log(
+  `Re-exposed ${tools.length} tools; ${typedTools} carry typed params (${typedParams} params total).`,
+);
+console.log(
+  'Under the old z.any() mapping every one of these would be advertised as {} (typeless).',
+);
 if (typedTools === 0) {
   console.error('FAIL: no typed params — type preservation regressed.');
   process.exit(1);
@@ -67,20 +79,26 @@ console.log('OK: type preservation holds against a live server.\n');
 // used to slip through and hit the server. Skipped gracefully otherwise.
 const ae = tools.find((t) => t.name === 'x__app_events');
 const limitTyped =
-  ae && /"type":\s*\[?\s*"integer"|"type":\s*"integer"|"type":\s*"number"/.test(
+  ae &&
+  /"type":\s*\[?\s*"integer"|"type":\s*"integer"|"type":\s*"number"/.test(
     JSON.stringify(ae.inputSchema?.properties?.limit ?? {}),
   );
 if (!ae || !limitTyped) {
   console.log('Forward-path check skipped (no app_events/limit numeric tool).');
   process.exit(0);
 }
-console.log('Forward path — calling app_events {action:"get", limit:3} through the bundler:');
+console.log(
+  'Forward path — calling app_events {action:"get", limit:3} through the bundler:',
+);
 const numeric = await client.callTool({
   name: 'x__app_events',
   arguments: { action: 'get', limit: 3 },
 });
 if (numeric.isError) {
-  console.error('FAIL: a numeric limit was rejected/not forwarded:', JSON.stringify(numeric.content).slice(0, 120));
+  console.error(
+    'FAIL: a numeric limit was rejected/not forwarded:',
+    JSON.stringify(numeric.content).slice(0, 120),
+  );
   process.exit(1);
 }
 console.log('  number 3 -> forwarded, server accepted. ok');
@@ -90,9 +108,13 @@ const stringified = await client.callTool({
   arguments: { action: 'get', limit: '3' },
 });
 if (!stringified.isError) {
-  console.error('FAIL: a STRINGIFIED limit "3" was NOT caught at the proxy (the old bug).');
+  console.error(
+    'FAIL: a STRINGIFIED limit "3" was NOT caught at the proxy (the old bug).',
+  );
   process.exit(1);
 }
 console.log('  string "3" -> rejected at the proxy, never forwarded. ok');
-console.log('\nOK: typed args round-trip; stringified args are caught before the server.');
+console.log(
+  '\nOK: typed args round-trip; stringified args are caught before the server.',
+);
 process.exit(0);
