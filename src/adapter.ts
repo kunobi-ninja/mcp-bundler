@@ -49,6 +49,22 @@ type JsonSchemaNode = {
   required?: string[];
   /** OpenAPI 3.0 nullability (older schemars / OpenAPI-derived schemas). */
   nullable?: boolean;
+  /** Local reference into the root's `$defs` / `definitions`. */
+  $ref?: string;
+  anyOf?: JsonSchemaNode[];
+  oneOf?: JsonSchemaNode[];
+  $defs?: Record<string, JsonSchemaNode>;
+  definitions?: Record<string, JsonSchemaNode>;
+};
+
+/**
+ * Resolution context threaded through the whole mapping: the root's definition
+ * table (so `$ref`s resolve) plus the set of definition names currently being
+ * resolved (so a self-referential `$ref` terminates instead of looping).
+ */
+type ResolveCtx = {
+  defs: Record<string, JsonSchemaNode>;
+  seen: ReadonlySet<string>;
 };
 
 /**
@@ -78,7 +94,11 @@ function zodUnion(members: z.ZodTypeAny[]): z.ZodTypeAny {
 }
 
 /** Map ONE JSON-Schema `type` name to zod, reading `items`/`properties` off the node. */
-function zodForType(type: string, node: JsonSchemaNode): z.ZodTypeAny {
+function zodForType(
+  type: string,
+  node: JsonSchemaNode,
+  ctx: ResolveCtx,
+): z.ZodTypeAny {
   switch (type) {
     case 'string':
       return z.string();
@@ -97,13 +117,30 @@ function zodForType(type: string, node: JsonSchemaNode): z.ZodTypeAny {
     case 'null':
       return z.null();
     case 'array':
-      return z.array(jsonNodeToZod(node.items));
+      return z.array(jsonNodeToZod(node.items, ctx));
     case 'object':
-      return zodShapeFromJsonSchema(node as Tool['inputSchema']);
+      return objectShape(node, ctx);
     default:
       // Unknown type: stay permissive rather than reject.
       return z.any();
   }
+}
+
+/**
+ * Resolve a local `#/$defs/Name` (or `#/definitions/Name`) reference against the
+ * root table. Unknown/external/circular refs stay permissive (`z.any()`) — the
+ * proxy must never newly reject a value it cannot positively type.
+ */
+function resolveRef(ref: string, ctx: ResolveCtx): z.ZodTypeAny {
+  const match = /^#\/(?:\$defs|definitions)\/(.+)$/.exec(ref);
+  if (!match) return z.any(); // external or non-local ref
+  const name = match[1];
+  if (ctx.seen.has(name)) return z.any(); // cycle guard
+  const def = ctx.defs[name];
+  if (!def) return z.any(); // dangling ref
+  const seen = new Set(ctx.seen);
+  seen.add(name);
+  return jsonNodeToZod(def, { defs: ctx.defs, seen });
 }
 
 /** A node is nullable if `null` is a `type` member or `nullable: true` (OpenAPI). */
@@ -112,9 +149,27 @@ function nodeIsNullable(node: JsonSchemaNode): boolean {
   return Array.isArray(node.type) && node.type.includes('null');
 }
 
-function jsonNodeToZod(node: JsonSchemaNode | undefined): z.ZodTypeAny {
+function jsonNodeToZod(
+  node: JsonSchemaNode | undefined,
+  ctx: ResolveCtx,
+): z.ZodTypeAny {
   if (!node || typeof node !== 'object') {
     return z.any();
+  }
+
+  // A local `$ref` resolves against the root `$defs`; this is how schemars
+  // types its enum fields (`mode`, `mcp_failure_mode`, `limit_kind`, …).
+  if (typeof node.$ref === 'string') {
+    return resolveRef(node.$ref, ctx);
+  }
+
+  // `anyOf`/`oneOf` → a union of the mapped members. Covers the schemars
+  // nullable-enum shape `anyOf:[{$ref:...},{type:"null"}]`. Union is >= "one of"
+  // (looser than oneOf's "exactly one"), which is the safe direction for a
+  // proxy: never reject a value a branch accepts; the downstream is strict.
+  const branches = node.anyOf ?? node.oneOf;
+  if (Array.isArray(branches) && branches.length > 0) {
+    return zodUnion(branches.map((b) => jsonNodeToZod(b, ctx)));
   }
 
   // An explicit enum is the tightest constraint; honor it before `type` — but
@@ -148,10 +203,10 @@ function jsonNodeToZod(node: JsonSchemaNode | undefined): z.ZodTypeAny {
   // a wrong-typed scalar is still rejected. Taking only the first member would
   // drop the `null` branch and break clearing — a regression.
   if (Array.isArray(node.type)) {
-    return zodUnion(node.type.map((t) => zodForType(t, node)));
+    return zodUnion(node.type.map((t) => zodForType(t, node, ctx)));
   }
   if (typeof node.type === 'string') {
-    const mapped = zodForType(node.type, node);
+    const mapped = zodForType(node.type, node, ctx);
     // OpenAPI-style nullable (`{type:"string",nullable:true}`) — accept null too.
     return node.nullable === true ? mapped.nullable() : mapped;
   }
@@ -162,10 +217,11 @@ function jsonNodeToZod(node: JsonSchemaNode | undefined): z.ZodTypeAny {
   return z.any();
 }
 
-export function zodShapeFromJsonSchema(
-  inputSchema: Tool['inputSchema'],
+/** Build the zod object shape for one object node, under a resolution context. */
+function objectShape(
+  schema: JsonSchemaNode | undefined,
+  ctx: ResolveCtx,
 ): z.ZodTypeAny {
-  const schema = inputSchema as JsonSchemaNode | undefined;
   const properties = schema?.properties;
   const required = schema?.required || [];
 
@@ -175,7 +231,7 @@ export function zodShapeFromJsonSchema(
 
   const shape: Record<string, z.ZodTypeAny> = {};
   for (const [name, prop] of Object.entries(properties)) {
-    let field = jsonNodeToZod(prop);
+    let field = jsonNodeToZod(prop, ctx);
     if (prop?.description) {
       field = field.describe(prop.description);
     }
@@ -185,6 +241,19 @@ export function zodShapeFromJsonSchema(
     shape[name] = field;
   }
   return z.object(shape).passthrough();
+}
+
+export function zodShapeFromJsonSchema(
+  inputSchema: Tool['inputSchema'],
+): z.ZodTypeAny {
+  const schema = inputSchema as JsonSchemaNode | undefined;
+  // The definition table lives at the ROOT; capture it once and thread it down
+  // so nested `$ref`s (which carry no defs of their own) still resolve.
+  const ctx: ResolveCtx = {
+    defs: schema?.$defs ?? schema?.definitions ?? {},
+    seen: new Set(),
+  };
+  return objectShape(schema, ctx);
 }
 
 function promptArgsShape(prompt: Prompt): Record<string, z.ZodTypeAny> {

@@ -113,7 +113,10 @@ describe('zodShapeFromJsonSchema — type fidelity', () => {
   // that `null` still passes while the wrong scalar type is still rejected.
 
   it('Option<integer> — {type:[integer,null]}: accepts a number AND null, rejects a string', () => {
-    const s = fieldSchema({ type: ['integer', 'null'], format: 'uint16' }, false);
+    const s = fieldSchema(
+      { type: ['integer', 'null'], format: 'uint16' },
+      false,
+    );
     expect(s.safeParse({ v: 8080 }).success).toBe(true);
     expect(s.safeParse({ v: null }).success).toBe(true); // clearing must work
     expect(s.safeParse({ v: '8080' }).success).toBe(false);
@@ -134,7 +137,10 @@ describe('zodShapeFromJsonSchema — type fidelity', () => {
   });
 
   it('Option<array> — {type:[array,null], items:string}: accepts string[] AND null, rejects number[]', () => {
-    const s = fieldSchema({ type: ['array', 'null'], items: { type: 'string' } }, false);
+    const s = fieldSchema(
+      { type: ['array', 'null'], items: { type: 'string' } },
+      false,
+    );
     expect(s.safeParse({ v: ['a'] }).success).toBe(true);
     expect(s.safeParse({ v: null }).success).toBe(true);
     expect(s.safeParse({ v: [1] }).success).toBe(false);
@@ -186,6 +192,86 @@ describe('zodShapeFromJsonSchema — type fidelity', () => {
     // Stringified scalar — must still fail (the original bug).
     expect(s.safeParse({ port: '9090' }).success).toBe(false);
     expect(s.safeParse({ mcp_stateful: 'false' }).success).toBe(false);
+  });
+
+  // ── $ref / anyOf resolution against root $defs ────────────────────────────
+  // schemars emits enum fields as `{$ref:"#/$defs/Name"}` or, when optional,
+  // `{anyOf:[{$ref:"#/$defs/Name"},{type:"null"}]}`, with the enum living under
+  // the schema root's `$defs`. Resolving them types `mode`, `mcp_failure_mode`,
+  // `limit_kind`, etc. Resolution only kicks in when `$defs` is actually present
+  // at the root — a bare $ref with no defs stays permissive (no regression).
+
+  it('resolves a bare $ref to its $defs enum (rejects a non-member)', () => {
+    const s = zodShapeFromJsonSchema({
+      type: 'object',
+      $defs: { Mode: { type: 'string', enum: ['llm', 'mcp'] } },
+      properties: { mode: { $ref: '#/$defs/Mode' } },
+      required: ['mode'],
+    } as unknown as Tool['inputSchema']);
+    expect(s.safeParse({ mode: 'llm' }).success).toBe(true);
+    expect(s.safeParse({ mode: 'mcp' }).success).toBe(true);
+    expect(s.safeParse({ mode: 'bogus' }).success).toBe(false); // now typed
+  });
+
+  it('resolves anyOf:[{$ref},{null}] to enum-or-null (member ok, null ok, junk rejected)', () => {
+    const s = zodShapeFromJsonSchema({
+      type: 'object',
+      $defs: { Mode: { type: 'string', enum: ['llm', 'mcp'] } },
+      properties: {
+        mode: { anyOf: [{ $ref: '#/$defs/Mode' }, { type: 'null' }] },
+      },
+      required: [],
+    } as unknown as Tool['inputSchema']);
+    expect(s.safeParse({ mode: 'llm' }).success).toBe(true);
+    expect(s.safeParse({ mode: null }).success).toBe(true); // nullable
+    expect(s.safeParse({}).success).toBe(true); // optional
+    expect(s.safeParse({ mode: 'bogus' }).success).toBe(false);
+  });
+
+  it('supports `definitions` (draft-07) as well as `$defs`', () => {
+    const s = zodShapeFromJsonSchema({
+      type: 'object',
+      definitions: { Kind: { type: 'string', enum: ['requests', 'tokens'] } },
+      properties: { kind: { $ref: '#/definitions/Kind' } },
+      required: ['kind'],
+    } as unknown as Tool['inputSchema']);
+    expect(s.safeParse({ kind: 'tokens' }).success).toBe(true);
+    expect(s.safeParse({ kind: 'nope' }).success).toBe(false);
+  });
+
+  it('an UNRESOLVABLE $ref stays permissive (no regression)', () => {
+    const s = zodShapeFromJsonSchema({
+      type: 'object',
+      $defs: {},
+      properties: { x: { $ref: '#/$defs/Missing' } },
+      required: [],
+    } as unknown as Tool['inputSchema']);
+    expect(s.safeParse({ x: 'anything' }).success).toBe(true);
+    expect(s.safeParse({ x: 123 }).success).toBe(true);
+  });
+
+  it('a CIRCULAR $ref terminates and stays permissive (no infinite loop)', () => {
+    const s = zodShapeFromJsonSchema({
+      type: 'object',
+      $defs: {
+        Node: {
+          type: 'object',
+          properties: { next: { $ref: '#/$defs/Node' } },
+        },
+      },
+      properties: { root: { $ref: '#/$defs/Node' } },
+      required: [],
+    } as unknown as Tool['inputSchema']);
+    expect(s.safeParse({ root: { next: {} } }).success).toBe(true);
+  });
+
+  it('oneOf maps to a union of its members', () => {
+    const s = fieldSchema({
+      oneOf: [{ type: 'string' }, { type: 'integer' }],
+    });
+    expect(s.safeParse({ v: 'x' }).success).toBe(true);
+    expect(s.safeParse({ v: 7 }).success).toBe(true);
+    expect(s.safeParse({ v: true }).success).toBe(false);
   });
 
   it('a mixed real-world tool schema round-trips every typed value', () => {

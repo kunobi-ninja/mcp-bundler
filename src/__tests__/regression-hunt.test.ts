@@ -64,7 +64,10 @@ describe('HUNT: nullable encodings the mapper does not model', () => {
   it('{type:["string","null"],enum:["a","b"]} — enum branch must not shadow the null branch', () => {
     // Some generators emit a nullable enum as a type-array plus an enum list
     // that omits null. `type` says null is legal; downstream accepts it.
-    const s = fieldSchema({ type: ['string', 'null'], enum: ['a', 'b'] }, false);
+    const s = fieldSchema(
+      { type: ['string', 'null'], enum: ['a', 'b'] },
+      false,
+    );
     expect(s.safeParse({ v: 'a' }).success).toBe(true);
     expect(s.safeParse({ v: null }).success).toBe(true); // old-accept probe
   });
@@ -77,14 +80,19 @@ describe('HUNT: composite keywords without a top-level type stay permissive', ()
     expect(s.safeParse({ v: 42 }).success).toBe(true); // old z.any() accepted
   });
 
-  it('oneOf: [{type:"string"},{type:"integer"}] — permissive', () => {
+  it('oneOf: [{type:"string"},{type:"integer"}] — now a union of members', () => {
+    // oneOf is mapped to a union (see the $ref/anyOf resolution change): it
+    // accepts either member type. Rejecting a clearly-wrong type (an object)
+    // is NOT a regression — a downstream String|Int field rejects it too, so no
+    // downstream-valid value is lost. (Union is looser than oneOf's "exactly
+    // one", which is the safe direction for a proxy: never reject a valid value.)
     const s = fieldSchema(
       { oneOf: [{ type: 'string' }, { type: 'integer' }] },
       true,
     );
     expect(s.safeParse({ v: 'x' }).success).toBe(true);
     expect(s.safeParse({ v: 7 }).success).toBe(true);
-    expect(s.safeParse({ v: { even: 'this' } }).success).toBe(true);
+    expect(s.safeParse({ v: { even: 'this' } }).success).toBe(false);
   });
 
   it('bare const (no type): {const:"fixed"} — permissive', () => {
@@ -100,7 +108,10 @@ describe('HUNT: composite keywords without a top-level type stay permissive', ()
 });
 
 describe('HUNT: tuple-style items (items as an ARRAY of schemas)', () => {
-  const tuple = { type: 'array', items: [{ type: 'string' }, { type: 'number' }] };
+  const tuple = {
+    type: 'array',
+    items: [{ type: 'string' }, { type: 'number' }],
+  };
 
   it('a correct tuple value is accepted', () => {
     const s = fieldSchema(tuple, true);
@@ -129,7 +140,10 @@ describe('HUNT: non-string enums', () => {
   });
 
   it('enum containing null {type:["string","null"],enum:["a",null]} — null member accepted', () => {
-    const s = fieldSchema({ type: ['string', 'null'], enum: ['a', null] }, false);
+    const s = fieldSchema(
+      { type: ['string', 'null'], enum: ['a', null] },
+      false,
+    );
     expect(s.safeParse({ v: 'a' }).success).toBe(true);
     expect(s.safeParse({ v: null }).success).toBe(true);
   });
@@ -137,7 +151,10 @@ describe('HUNT: non-string enums', () => {
   it('enum of OBJECT values — a deep-equal member was accepted by z.any() and by downstream', () => {
     // Valid JSON Schema: enum members may be any JSON value. z.literal compares
     // by identity/includes, so a structurally-equal object can never match.
-    const s = fieldSchema({ enum: [{ level: 'high' }, { level: 'low' }] }, true);
+    const s = fieldSchema(
+      { enum: [{ level: 'high' }, { level: 'low' }] },
+      true,
+    );
     expect(s.safeParse({ v: { level: 'high' } }).success).toBe(true); // old-accept probe
   });
 
@@ -164,7 +181,10 @@ describe('HUNT: uint64 beyond Number.MAX_SAFE_INTEGER (real production shape: re
   });
 
   it('u64-scale value (~1.8e19) on the verbatim request_timeout_secs shape {type:["integer","null"],format:"uint64"}', () => {
-    const s = fieldSchema({ type: ['integer', 'null'], format: 'uint64' }, false);
+    const s = fieldSchema(
+      { type: ['integer', 'null'], format: 'uint64' },
+      false,
+    );
     expect(s.safeParse({ v: null }).success).toBe(true); // clearing still works
     expect(s.safeParse({ v: 2 ** 63 }).success).toBe(true); // old-accept probe
   });

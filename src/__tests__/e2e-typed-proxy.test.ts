@@ -59,7 +59,9 @@ async function linkedPair(bundler: McpBundler) {
     { name: 'hub', version: '0.0.1' },
     { capabilities: { tools: { listChanged: true } } },
   );
-  const adapter = new McpBundlerServerAdapter(bundler, { toolPrefix: 'local__' });
+  const adapter = new McpBundlerServerAdapter(bundler, {
+    toolPrefix: 'local__',
+  });
   await adapter.registerTools(server);
 
   const client = new Client({ name: 'agent', version: '0.0.1' });
@@ -145,6 +147,65 @@ describe('e2e: proxied tool advertises real types and forwards them intact', () 
       auto_start: true,
       provider_ids: ['a', 'b'],
     });
+  });
+
+  it('(3) $ref/anyOf enum field is advertised TYPED and validated end-to-end', async () => {
+    const bundler = new McpBundler({
+      name: 'local',
+      transport: { type: 'http', url: 'http://127.0.0.1:9999/mcp' },
+      reconnect: { enabled: false },
+      logger: () => {},
+    });
+    // schemars encodes an optional enum as anyOf[{$ref},{null}] with the enum
+    // under root $defs — the shape that used to advertise a typeless `{}`.
+    vi.spyOn(bundler, 'listTools').mockResolvedValue([
+      {
+        name: 'proxy_update',
+        description: 'x',
+        inputSchema: {
+          type: 'object',
+          $defs: { ProxyModeRec: { type: 'string', enum: ['llm', 'mcp'] } },
+          properties: {
+            mode: {
+              anyOf: [{ $ref: '#/$defs/ProxyModeRec' }, { type: 'null' }],
+            },
+          },
+          required: [],
+        },
+      } as Tool,
+    ]);
+    const callTool = vi
+      .spyOn(bundler, 'callTool')
+      .mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
+
+    const { client } = await linkedPair(bundler);
+
+    // (a) advertised schema carries the enum, not the old typeless {}.
+    const { tools } = await client.listTools();
+    const mode = (
+      tools.find((t) => t.name === 'local__proxy_update')?.inputSchema
+        ?.properties as Record<string, unknown> | undefined
+    )?.mode;
+    expect(JSON.stringify(mode)).toContain('llm');
+    expect(JSON.stringify(mode)).toContain('mcp');
+
+    // (b) a valid member forwards; (c) a bogus value is rejected UPSTREAM (never
+    // reaches the downstream), because the enum is now validated at the proxy.
+    await client.callTool({
+      name: 'local__proxy_update',
+      arguments: { mode: 'llm' },
+    });
+    expect(callTool).toHaveBeenCalledWith('proxy_update', { mode: 'llm' });
+
+    // A bogus enum value is rejected at the proxy (surfaced as an error result)
+    // and NEVER forwarded downstream — the SDK validates against the advertised
+    // schema before the handler runs.
+    const bogus = await client.callTool({
+      name: 'local__proxy_update',
+      arguments: { mode: 'bogus' },
+    });
+    expect(bogus.isError).toBe(true);
+    expect(callTool).toHaveBeenCalledTimes(1); // 'llm' only; 'bogus' never forwarded
   });
 
   it('(2b) null field-clearing still forwards (regression guard for Option<T>)', async () => {
