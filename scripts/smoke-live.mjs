@@ -58,5 +58,41 @@ if (typedTools === 0) {
   console.error('FAIL: no typed params — type preservation regressed.');
   process.exit(1);
 }
-console.log('OK: type preservation holds against a live server.');
+console.log('OK: type preservation holds against a live server.\n');
+
+// ── Forward path: a real typed call round-trips to the live server ───────────
+// If the downstream exposes Kunobi's read-only `app_events` (numeric `limit`),
+// prove end-to-end that (a) a NUMBER forwards and the server accepts it, and
+// (b) a STRINGIFIED number is now caught AT THE PROXY — the exact mangling that
+// used to slip through and hit the server. Skipped gracefully otherwise.
+const ae = tools.find((t) => t.name === 'x__app_events');
+const limitTyped =
+  ae && /"type":\s*\[?\s*"integer"|"type":\s*"integer"|"type":\s*"number"/.test(
+    JSON.stringify(ae.inputSchema?.properties?.limit ?? {}),
+  );
+if (!ae || !limitTyped) {
+  console.log('Forward-path check skipped (no app_events/limit numeric tool).');
+  process.exit(0);
+}
+console.log('Forward path — calling app_events {action:"get", limit:3} through the bundler:');
+const numeric = await client.callTool({
+  name: 'x__app_events',
+  arguments: { action: 'get', limit: 3 },
+});
+if (numeric.isError) {
+  console.error('FAIL: a numeric limit was rejected/not forwarded:', JSON.stringify(numeric.content).slice(0, 120));
+  process.exit(1);
+}
+console.log('  number 3 -> forwarded, server accepted. ok');
+
+const stringified = await client.callTool({
+  name: 'x__app_events',
+  arguments: { action: 'get', limit: '3' },
+});
+if (!stringified.isError) {
+  console.error('FAIL: a STRINGIFIED limit "3" was NOT caught at the proxy (the old bug).');
+  process.exit(1);
+}
+console.log('  string "3" -> rejected at the proxy, never forwarded. ok');
+console.log('\nOK: typed args round-trip; stringified args are caught before the server.');
 process.exit(0);
