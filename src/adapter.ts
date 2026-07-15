@@ -65,7 +65,13 @@ type JsonSchemaNode = {
 type ResolveCtx = {
   defs: Record<string, JsonSchemaNode>;
   seen: ReadonlySet<string>;
+  /** Ref-resolution depth, bounded to keep deep/recursive $ref chains from
+   *  overflowing the stack (the `seen` set stops cycles, not linear depth). */
+  depth: number;
 };
+
+/** Max $ref-resolution depth before we stop and stay permissive. */
+const MAX_REF_DEPTH = 64;
 
 /**
  * Map a single JSON-Schema node to a zod type, HONORING its declared `type`.
@@ -132,6 +138,7 @@ function zodForType(
  * proxy must never newly reject a value it cannot positively type.
  */
 function resolveRef(ref: string, ctx: ResolveCtx): z.ZodTypeAny {
+  if (ctx.depth >= MAX_REF_DEPTH) return z.any(); // depth bound (deep chains)
   const match = /^#\/(?:\$defs|definitions)\/(.+)$/.exec(ref);
   if (!match) return z.any(); // external or non-local ref
   const name = match[1];
@@ -140,13 +147,34 @@ function resolveRef(ref: string, ctx: ResolveCtx): z.ZodTypeAny {
   if (!def) return z.any(); // dangling ref
   const seen = new Set(ctx.seen);
   seen.add(name);
-  return jsonNodeToZod(def, { defs: ctx.defs, seen });
+  return jsonNodeToZod(def, { defs: ctx.defs, seen, depth: ctx.depth + 1 });
 }
 
 /** A node is nullable if `null` is a `type` member or `nullable: true` (OpenAPI). */
 function nodeIsNullable(node: JsonSchemaNode): boolean {
   if (node.nullable === true) return true;
   return Array.isArray(node.type) && node.type.includes('null');
+}
+
+/**
+ * Base scalar type for an enum node: its declared `type` (minus `null`), or —
+ * when untyped — inferred from the members if they share one primitive type.
+ * `undefined` means "can't tell" → caller stays permissive (`z.any()`).
+ */
+function enumBaseType(node: JsonSchemaNode): string | undefined {
+  if (typeof node.type === 'string' && node.type !== 'null') return node.type;
+  if (Array.isArray(node.type)) {
+    const t = node.type.find((x) => x !== 'null');
+    if (t) return t;
+  }
+  const members = (node.enum ?? []).filter((v) => v !== null);
+  if (members.length === 0) return undefined;
+  const t = typeof members[0];
+  if ((t === 'string' || t === 'number' || t === 'boolean') &&
+    members.every((v) => typeof v === t)) {
+    return t;
+  }
+  return undefined; // mixed / object / array members → permissive
 }
 
 function jsonNodeToZod(
@@ -172,29 +200,19 @@ function jsonNodeToZod(
     return zodUnion(branches.map((b) => jsonNodeToZod(b, ctx)));
   }
 
-  // An explicit enum is the tightest constraint; honor it before `type` — but
-  // only when every member is a primitive `z.literal` can match. `z.literal`
-  // compares non-primitives by reference, so an object/array-valued enum member
-  // could never match a structurally-equal input; stay permissive there rather
-  // than reject a valid value (the old `z.any()` accepted it).
+  // An enum: type by its BASE type, do NOT enforce membership with a literal
+  // union. A downstream may legitimately accept values outside the advertised
+  // member list — e.g. Rust serde `#[serde(alias = "…")]`, which schemars does
+  // NOT emit into the enum — so rejecting a non-member would reject a
+  // downstream-valid value (a regression; found by cross-family review). We
+  // still constrain the TYPE (a string enum → `z.string()`, so a stringified
+  // number is still rejected), just not the specific values. Nullable when the
+  // node declares it or `null` is itself a member.
   if (Array.isArray(node.enum) && node.enum.length > 0) {
-    const isPrimitive = (v: unknown) =>
-      v === null ||
-      typeof v === 'string' ||
-      typeof v === 'number' ||
-      typeof v === 'boolean';
-    if (!node.enum.every(isPrimitive)) {
-      return z.any();
-    }
-    const en = zodUnion(
-      node.enum.map((v) => z.literal(v as Parameters<typeof z.literal>[0])),
-    );
-    // Respect nullability declared alongside the enum (e.g. a nullable enum
-    // encoded as `{type:["string","null"],enum:[...]}` — the enum list omits
-    // null, so the `null` type member must not be silently dropped).
-    return nodeIsNullable(node) && !node.enum.includes(null)
-      ? en.nullable()
-      : en;
+    const base = enumBaseType(node);
+    const mapped = base ? zodForType(base, node, ctx) : z.any();
+    const nullable = nodeIsNullable(node) || node.enum.includes(null);
+    return nullable ? mapped.nullable() : mapped;
   }
 
   // JSON Schema allows `type` to be an array (a union) — and schemars encodes
@@ -223,7 +241,9 @@ function objectShape(
   ctx: ResolveCtx,
 ): z.ZodTypeAny {
   const properties = schema?.properties;
-  const required = schema?.required || [];
+  // A malformed `required` (not an array — e.g. a hand-written or non-schemars
+  // downstream) must not throw during registration and kill the whole tool.
+  const required = Array.isArray(schema?.required) ? schema.required : [];
 
   if (!properties || Object.keys(properties).length === 0) {
     return z.object({}).passthrough();
@@ -252,6 +272,7 @@ export function zodShapeFromJsonSchema(
   const ctx: ResolveCtx = {
     defs: schema?.$defs ?? schema?.definitions ?? {},
     seen: new Set(),
+    depth: 0,
   };
   return objectShape(schema, ctx);
 }

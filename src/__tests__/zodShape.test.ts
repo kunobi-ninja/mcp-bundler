@@ -60,10 +60,15 @@ describe('zodShapeFromJsonSchema — type fidelity', () => {
     expect(s.safeParse({ v: [1, 2] }).success).toBe(false);
   });
 
-  it('enum: accepts a member, rejects a non-member', () => {
+  it('string enum: typed as string (accepts members AND non-members), rejects wrong type', () => {
+    // Enums are typed by their BASE type, not enforced by membership: a
+    // downstream may accept values outside the advertised list via serde
+    // `#[serde(alias)]`, so rejecting a non-member would be a regression. We
+    // still reject the wrong TYPE (a stringified/other type).
     const s = fieldSchema({ type: 'string', enum: ['llm', 'mcp'] });
     expect(s.safeParse({ v: 'llm' }).success).toBe(true);
-    expect(s.safeParse({ v: 'other' }).success).toBe(false);
+    expect(s.safeParse({ v: 'legacy' }).success).toBe(true); // serde alias — must NOT reject
+    expect(s.safeParse({ v: 42 }).success).toBe(false); // wrong type still rejected
   });
 
   it('nested object: recurses and enforces inner types', () => {
@@ -201,7 +206,7 @@ describe('zodShapeFromJsonSchema — type fidelity', () => {
   // `limit_kind`, etc. Resolution only kicks in when `$defs` is actually present
   // at the root — a bare $ref with no defs stays permissive (no regression).
 
-  it('resolves a bare $ref to its $defs enum (rejects a non-member)', () => {
+  it('resolves a bare $ref to its $defs enum as a TYPE (string), not membership', () => {
     const s = zodShapeFromJsonSchema({
       type: 'object',
       $defs: { Mode: { type: 'string', enum: ['llm', 'mcp'] } },
@@ -209,11 +214,13 @@ describe('zodShapeFromJsonSchema — type fidelity', () => {
       required: ['mode'],
     } as unknown as Tool['inputSchema']);
     expect(s.safeParse({ mode: 'llm' }).success).toBe(true);
-    expect(s.safeParse({ mode: 'mcp' }).success).toBe(true);
-    expect(s.safeParse({ mode: 'bogus' }).success).toBe(false); // now typed
+    // A resolved enum is typed as string, NOT enforced by membership — a serde
+    // alias the downstream accepts must not be rejected (cross-family finding).
+    expect(s.safeParse({ mode: 'legacy' }).success).toBe(true);
+    expect(s.safeParse({ mode: 123 }).success).toBe(false); // wrong type rejected
   });
 
-  it('resolves anyOf:[{$ref},{null}] to enum-or-null (member ok, null ok, junk rejected)', () => {
+  it('resolves anyOf:[{$ref},{null}] to string|null (member ok, null ok, wrong type rejected)', () => {
     const s = zodShapeFromJsonSchema({
       type: 'object',
       $defs: { Mode: { type: 'string', enum: ['llm', 'mcp'] } },
@@ -223,9 +230,61 @@ describe('zodShapeFromJsonSchema — type fidelity', () => {
       required: [],
     } as unknown as Tool['inputSchema']);
     expect(s.safeParse({ mode: 'llm' }).success).toBe(true);
+    expect(s.safeParse({ mode: 'legacy' }).success).toBe(true); // alias-safe
     expect(s.safeParse({ mode: null }).success).toBe(true); // nullable
     expect(s.safeParse({}).success).toBe(true); // optional
-    expect(s.safeParse({ mode: 'bogus' }).success).toBe(false);
+    expect(s.safeParse({ mode: 123 }).success).toBe(false); // wrong type
+  });
+
+  // ── Cross-family review findings (codex): robustness + alias safety ─────────
+  it('serde alias: a resolved enum accepts a value outside its member list', () => {
+    // #[serde(alias="legacy")] on a Rust enum → schemars omits the alias, but
+    // serde accepts it. Enforcing membership would reject a downstream-valid
+    // value. (The whole reason enums are typed, not membership-checked.)
+    const s = zodShapeFromJsonSchema({
+      type: 'object',
+      $defs: { Mode: { type: 'string', enum: ['llm', 'mcp'] } },
+      properties: { mode: { $ref: '#/$defs/Mode' } },
+      required: ['mode'],
+    } as unknown as Tool['inputSchema']);
+    expect(s.safeParse({ mode: 'legacy' }).success).toBe(true);
+  });
+
+  it('a DEEP $ref chain terminates without a stack overflow', () => {
+    const $defs: Record<string, unknown> = {};
+    for (let i = 0; i < 5000; i++) {
+      $defs[`D${i}`] = {
+        type: 'object',
+        properties: { next: { $ref: `#/$defs/D${i + 1}` } },
+      };
+    }
+    $defs.D5000 = { $ref: '#/$defs/D0' };
+    const s = zodShapeFromJsonSchema({
+      type: 'object',
+      $defs,
+      properties: { root: { $ref: '#/$defs/D0' } },
+      required: [],
+    } as unknown as Tool['inputSchema']);
+    // Must not throw RangeError; the depth bound falls back to permissive.
+    expect(s.safeParse({ root: { next: {} } }).success).toBe(true);
+  });
+
+  it('a MALFORMED $defs node (required:1) does not crash registration', () => {
+    const build = () =>
+      zodShapeFromJsonSchema({
+        type: 'object',
+        $defs: {
+          X: {
+            type: 'object',
+            properties: { a: { type: 'string' } },
+            required: 1,
+          },
+        },
+        properties: { v: { $ref: '#/$defs/X' } },
+        required: ['v'],
+      } as unknown as Tool['inputSchema']);
+    expect(build).not.toThrow();
+    expect(build().safeParse({ v: { a: 'ok' } }).success).toBe(true);
   });
 
   it('supports `definitions` (draft-07) as well as `$defs`', () => {
@@ -236,7 +295,8 @@ describe('zodShapeFromJsonSchema — type fidelity', () => {
       required: ['kind'],
     } as unknown as Tool['inputSchema']);
     expect(s.safeParse({ kind: 'tokens' }).success).toBe(true);
-    expect(s.safeParse({ kind: 'nope' }).success).toBe(false);
+    expect(s.safeParse({ kind: 'nope' }).success).toBe(true); // typed, not membership-enforced
+    expect(s.safeParse({ kind: 42 }).success).toBe(false); // wrong type rejected
   });
 
   it('an UNRESOLVABLE $ref stays permissive (no regression)', () => {

@@ -180,32 +180,41 @@ describe('e2e: proxied tool advertises real types and forwards them intact', () 
 
     const { client } = await linkedPair(bundler);
 
-    // (a) advertised schema carries the enum, not the old typeless {}.
+    // (a) the $ref/anyOf field is advertised with a real TYPE (string|null),
+    // not the old typeless `{}` — so the model knows it's a string, not junk.
     const { tools } = await client.listTools();
     const mode = (
       tools.find((t) => t.name === 'local__proxy_update')?.inputSchema
         ?.properties as Record<string, unknown> | undefined
     )?.mode;
-    expect(JSON.stringify(mode)).toContain('llm');
-    expect(JSON.stringify(mode)).toContain('mcp');
+    expect(JSON.stringify(mode)).toContain('string');
+    expect(JSON.stringify(mode)).toContain('null'); // nullable via anyOf
+    expect(JSON.stringify(mode)).not.toBe('{}'); // not typeless
 
-    // (b) a valid member forwards; (c) a bogus value is rejected UPSTREAM (never
-    // reaches the downstream), because the enum is now validated at the proxy.
+    // (b) a member forwards; (c) so does a NON-member string (serde-alias-safe:
+    // membership is NOT enforced at the proxy, only the type). A wrong TYPE is
+    // rejected upstream.
     await client.callTool({
       name: 'local__proxy_update',
       arguments: { mode: 'llm' },
     });
-    expect(callTool).toHaveBeenCalledWith('proxy_update', { mode: 'llm' });
-
-    // A bogus enum value is rejected at the proxy (surfaced as an error result)
-    // and NEVER forwarded downstream — the SDK validates against the advertised
-    // schema before the handler runs.
-    const bogus = await client.callTool({
+    await client.callTool({
       name: 'local__proxy_update',
-      arguments: { mode: 'bogus' },
+      arguments: { mode: 'legacy' }, // serde alias — must forward, not reject
     });
-    expect(bogus.isError).toBe(true);
-    expect(callTool).toHaveBeenCalledTimes(1); // 'llm' only; 'bogus' never forwarded
+    expect(callTool).toHaveBeenNthCalledWith(1, 'proxy_update', {
+      mode: 'llm',
+    });
+    expect(callTool).toHaveBeenNthCalledWith(2, 'proxy_update', {
+      mode: 'legacy',
+    });
+
+    const wrongType = await client.callTool({
+      name: 'local__proxy_update',
+      arguments: { mode: 123 }, // wrong type — rejected at the proxy
+    });
+    expect(wrongType.isError).toBe(true);
+    expect(callTool).toHaveBeenCalledTimes(2); // 123 never forwarded
   });
 
   it('(2b) null field-clearing still forwards (regression guard for Option<T>)', async () => {
