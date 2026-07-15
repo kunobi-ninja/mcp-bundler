@@ -39,13 +39,85 @@ export interface McpBundlerServerAdapterOptions {
   mapResource?: (resource: Resource) => BundledResourceRegistration;
 }
 
-function zodShapeFromJsonSchema(
+/** Minimal shape of a JSON-Schema node we read when mapping to zod. */
+type JsonSchemaNode = {
+  type?: string | string[];
+  description?: string;
+  enum?: unknown[];
+  items?: JsonSchemaNode;
+  properties?: Record<string, JsonSchemaNode>;
+  required?: string[];
+};
+
+/**
+ * Map a single JSON-Schema node to a zod type, HONORING its declared `type`.
+ *
+ * Why this matters: the produced zod schema is what the MCP SDK re-serializes
+ * back to JSON Schema when advertising a proxied variant tool upstream. If we
+ * collapse every field to `z.any()` (as this once did), the re-exposed tool
+ * carries NO type information, so a client/model sends scalars with the wrong
+ * JSON type (a number as "3999", a boolean as "false"). The downstream app then
+ * validates strictly against its real typed schema and rejects them — a bogus
+ * SCHEMA_INVALID. Preserving the type keeps args faithful end-to-end.
+ * See kunobi-frontend#2565.
+ *
+ * Deliberately NOT coercing (no `z.coerce.*`): coercion would let a wrong-typed
+ * value through here and mask the real contract, and string→boolean coercion is
+ * unsound ("false" is truthy). A genuinely untyped node still falls back to
+ * `z.any()`, so anything the schema doesn't describe stays permissive.
+ */
+function jsonNodeToZod(node: JsonSchemaNode | undefined): z.ZodTypeAny {
+  if (!node || typeof node !== 'object') {
+    return z.any();
+  }
+
+  // An explicit enum is the tightest constraint; honor it before `type`.
+  if (Array.isArray(node.enum) && node.enum.length > 0) {
+    const literals = node.enum.map((v) =>
+      z.literal(v as Parameters<typeof z.literal>[0]),
+    );
+    // z.union needs >= 2 members; a single-value enum is just that literal.
+    return literals.length === 1
+      ? literals[0]
+      : z.union(
+          literals as unknown as [
+            z.ZodTypeAny,
+            z.ZodTypeAny,
+            ...z.ZodTypeAny[],
+          ],
+        );
+  }
+
+  // JSON Schema allows `type` to be an array (union). Take the first known
+  // member; if none map cleanly, fall back to permissive.
+  const type = Array.isArray(node.type) ? node.type[0] : node.type;
+
+  switch (type) {
+    case 'string':
+      return z.string();
+    case 'integer':
+    case 'number':
+      return z.number();
+    case 'boolean':
+      return z.boolean();
+    case 'null':
+      return z.null();
+    case 'array':
+      return z.array(jsonNodeToZod(node.items));
+    case 'object':
+      return zodShapeFromJsonSchema(node as Tool['inputSchema']);
+    default:
+      // Unknown / absent type: stay permissive rather than reject.
+      return z.any();
+  }
+}
+
+export function zodShapeFromJsonSchema(
   inputSchema: Tool['inputSchema'],
 ): z.ZodTypeAny {
-  const properties = inputSchema?.properties as
-    | Record<string, { description?: string }>
-    | undefined;
-  const required = (inputSchema?.required as string[]) || [];
+  const schema = inputSchema as JsonSchemaNode | undefined;
+  const properties = schema?.properties;
+  const required = schema?.required || [];
 
   if (!properties || Object.keys(properties).length === 0) {
     return z.object({}).passthrough();
@@ -53,7 +125,7 @@ function zodShapeFromJsonSchema(
 
   const shape: Record<string, z.ZodTypeAny> = {};
   for (const [name, prop] of Object.entries(properties)) {
-    let field: z.ZodTypeAny = z.any();
+    let field = jsonNodeToZod(prop);
     if (prop?.description) {
       field = field.describe(prop.description);
     }
