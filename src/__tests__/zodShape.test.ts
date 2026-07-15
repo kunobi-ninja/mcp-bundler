@@ -104,6 +104,90 @@ describe('zodShapeFromJsonSchema — type fidelity', () => {
     if (r.success) expect((r.data as Record<string, unknown>).extra).toBe(7);
   });
 
+  // ── Regression guard: REAL schemars shapes ────────────────────────────────
+  // schemars encodes `Option<T>` as a type-array containing "null", and
+  // `Option<Enum>` as `anyOf: [{$ref}, {type:null}]`. These dominate the real
+  // tool schemas (every optional/clearable field). A naive `type[0]` mapping
+  // would reject `null` and break field-clearing — the exact path that sends
+  // `null` to clear `rate_limit_id` / `mcpSessionIdleTtlSecs`. These tests pin
+  // that `null` still passes while the wrong scalar type is still rejected.
+
+  it('Option<integer> — {type:[integer,null]}: accepts a number AND null, rejects a string', () => {
+    const s = fieldSchema({ type: ['integer', 'null'], format: 'uint16' }, false);
+    expect(s.safeParse({ v: 8080 }).success).toBe(true);
+    expect(s.safeParse({ v: null }).success).toBe(true); // clearing must work
+    expect(s.safeParse({ v: '8080' }).success).toBe(false);
+  });
+
+  it('Option<string> — {type:[string,null]}: accepts a string AND null, rejects a number', () => {
+    const s = fieldSchema({ type: ['string', 'null'] }, false);
+    expect(s.safeParse({ v: 'uuid' }).success).toBe(true);
+    expect(s.safeParse({ v: null }).success).toBe(true);
+    expect(s.safeParse({ v: 5 }).success).toBe(false);
+  });
+
+  it('Option<boolean> — {type:[boolean,null]}: accepts a boolean AND null, rejects "true"', () => {
+    const s = fieldSchema({ type: ['boolean', 'null'] }, false);
+    expect(s.safeParse({ v: true }).success).toBe(true);
+    expect(s.safeParse({ v: null }).success).toBe(true);
+    expect(s.safeParse({ v: 'true' }).success).toBe(false);
+  });
+
+  it('Option<array> — {type:[array,null], items:string}: accepts string[] AND null, rejects number[]', () => {
+    const s = fieldSchema({ type: ['array', 'null'], items: { type: 'string' } }, false);
+    expect(s.safeParse({ v: ['a'] }).success).toBe(true);
+    expect(s.safeParse({ v: null }).success).toBe(true);
+    expect(s.safeParse({ v: [1] }).success).toBe(false);
+  });
+
+  it('Option<Enum> — anyOf:[{$ref},{null}]: stays permissive (accepts the value AND null, no false reject)', () => {
+    // $ref is unresolved here (defs live at the schema root); the mapper must
+    // NOT reject a plausible enum value or null. Permissive is correct — the
+    // downstream app validates the enum strictly.
+    const s = fieldSchema(
+      { anyOf: [{ $ref: '#/$defs/ProxyModeRec' }, { type: 'null' }] },
+      false,
+    );
+    expect(s.safeParse({ v: 'llm' }).success).toBe(true);
+    expect(s.safeParse({ v: null }).success).toBe(true);
+  });
+
+  it('bare $ref: permissive (unresolved refs must not reject anything)', () => {
+    const s = fieldSchema({ $ref: '#/$defs/RateLimitKindRec' }, true);
+    expect(s.safeParse({ v: 'requests' }).success).toBe(true);
+    expect(s.safeParse({ v: { anything: 1 } }).success).toBe(true);
+  });
+
+  it('a real proxy_update-shaped schema clears optionals with null AND rejects stringified scalars', () => {
+    // Verbatim-shaped from the live schemars output for agentgateway__proxy_update.
+    const s = zodShapeFromJsonSchema({
+      type: 'object',
+      properties: {
+        port: { type: ['integer', 'null'], format: 'uint16' },
+        rate_limit_id: { type: ['string', 'null'] },
+        mcp_session_idle_ttl_secs: { type: ['integer', 'null'] },
+        mcp_stateful: { type: ['boolean', 'null'] },
+        provider_ids: { type: ['array', 'null'], items: { type: 'string' } },
+        mode: { anyOf: [{ $ref: '#/$defs/ProxyModeRec' }, { type: 'null' }] },
+      },
+      required: [],
+    } as unknown as Tool['inputSchema']);
+
+    // Clearing every optional with null — must pass (was the regression).
+    expect(
+      s.safeParse({
+        rate_limit_id: null,
+        mcp_session_idle_ttl_secs: null,
+        provider_ids: null,
+      }).success,
+    ).toBe(true);
+    // Real typed edit — must pass.
+    expect(s.safeParse({ port: 9090, provider_ids: ['a'] }).success).toBe(true);
+    // Stringified scalar — must still fail (the original bug).
+    expect(s.safeParse({ port: '9090' }).success).toBe(false);
+    expect(s.safeParse({ mcp_stateful: 'false' }).success).toBe(false);
+  });
+
   it('a mixed real-world tool schema round-trips every typed value', () => {
     // Mirrors an agentgateway proxy_add-style schema: the exact shape that
     // triggered the original SCHEMA_INVALID.

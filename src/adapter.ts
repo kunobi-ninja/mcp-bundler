@@ -66,36 +66,24 @@ type JsonSchemaNode = {
  * unsound ("false" is truthy). A genuinely untyped node still falls back to
  * `z.any()`, so anything the schema doesn't describe stays permissive.
  */
-function jsonNodeToZod(node: JsonSchemaNode | undefined): z.ZodTypeAny {
-  if (!node || typeof node !== 'object') {
-    return z.any();
-  }
+/** Build a union of zod types; collapses to the single member when len 1. */
+function zodUnion(members: z.ZodTypeAny[]): z.ZodTypeAny {
+  if (members.length === 0) return z.any();
+  if (members.length === 1) return members[0];
+  return z.union(
+    members as unknown as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]],
+  );
+}
 
-  // An explicit enum is the tightest constraint; honor it before `type`.
-  if (Array.isArray(node.enum) && node.enum.length > 0) {
-    const literals = node.enum.map((v) =>
-      z.literal(v as Parameters<typeof z.literal>[0]),
-    );
-    // z.union needs >= 2 members; a single-value enum is just that literal.
-    return literals.length === 1
-      ? literals[0]
-      : z.union(
-          literals as unknown as [
-            z.ZodTypeAny,
-            z.ZodTypeAny,
-            ...z.ZodTypeAny[],
-          ],
-        );
-  }
-
-  // JSON Schema allows `type` to be an array (union). Take the first known
-  // member; if none map cleanly, fall back to permissive.
-  const type = Array.isArray(node.type) ? node.type[0] : node.type;
-
+/** Map ONE JSON-Schema `type` name to zod, reading `items`/`properties` off the node. */
+function zodForType(type: string, node: JsonSchemaNode): z.ZodTypeAny {
   switch (type) {
     case 'string':
       return z.string();
     case 'integer':
+      // `.int()` serializes back to JSON Schema as `type: "integer"`, keeping
+      // the advertised schema faithful to the downstream contract.
+      return z.number().int();
     case 'number':
       return z.number();
     case 'boolean':
@@ -107,9 +95,39 @@ function jsonNodeToZod(node: JsonSchemaNode | undefined): z.ZodTypeAny {
     case 'object':
       return zodShapeFromJsonSchema(node as Tool['inputSchema']);
     default:
-      // Unknown / absent type: stay permissive rather than reject.
+      // Unknown type: stay permissive rather than reject.
       return z.any();
   }
+}
+
+function jsonNodeToZod(node: JsonSchemaNode | undefined): z.ZodTypeAny {
+  if (!node || typeof node !== 'object') {
+    return z.any();
+  }
+
+  // An explicit enum is the tightest constraint; honor it before `type`.
+  if (Array.isArray(node.enum) && node.enum.length > 0) {
+    return zodUnion(
+      node.enum.map((v) => z.literal(v as Parameters<typeof z.literal>[0])),
+    );
+  }
+
+  // JSON Schema allows `type` to be an array (a union) — and schemars encodes
+  // every `Option<T>` this way, e.g. `["integer","null"]`. Map EVERY member and
+  // union them, so a nullable field still accepts `null` (field-clearing) while
+  // a wrong-typed scalar is still rejected. Taking only the first member would
+  // drop the `null` branch and break clearing — a regression.
+  if (Array.isArray(node.type)) {
+    return zodUnion(node.type.map((t) => zodForType(t, node)));
+  }
+  if (typeof node.type === 'string') {
+    return zodForType(node.type, node);
+  }
+
+  // No `type` (anyOf / oneOf / $ref / allOf / untyped): stay permissive. The
+  // downstream server validates these strictly against its real schema; the
+  // proxy's job is only to preserve types it can see, never to newly reject.
+  return z.any();
 }
 
 export function zodShapeFromJsonSchema(
