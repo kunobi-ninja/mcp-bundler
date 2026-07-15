@@ -200,17 +200,27 @@ function jsonNodeToZod(
     return zodUnion(branches.map((b) => jsonNodeToZod(b, ctx)));
   }
 
-  // An enum: type by its BASE type, do NOT enforce membership with a literal
-  // union. A downstream may legitimately accept values outside the advertised
-  // member list — e.g. Rust serde `#[serde(alias = "…")]`, which schemars does
-  // NOT emit into the enum — so rejecting a non-member would reject a
-  // downstream-valid value (a regression; found by cross-family review). We
-  // still constrain the TYPE (a string enum → `z.string()`, so a stringified
-  // number is still rejected), just not the specific values. Nullable when the
-  // node declares it or `null` is itself a member.
+  // An enum: ADVERTISE the known values as hints (the model sees `llm`/`mcp`)
+  // while VALIDATING only the base type — so a downstream value outside the
+  // advertised list (e.g. a Rust serde `#[serde(alias = "…")]`, which schemars
+  // does NOT emit into the enum) still forwards instead of being rejected (a
+  // regression found by cross-family review). We do this with a union of the
+  // member literals AND the base type: the literals surface in the emitted JSON
+  // schema, and the trailing base-type branch accepts any other same-typed
+  // value. A wrong TYPE (a stringified number) is still rejected. Nullable when
+  // the node declares it or `null` is itself a member.
   if (Array.isArray(node.enum) && node.enum.length > 0) {
     const base = enumBaseType(node);
-    const mapped = base ? zodForType(base, node, ctx) : z.any();
+    let mapped: z.ZodTypeAny;
+    if (!base) {
+      mapped = z.any(); // mixed / object / array members → permissive
+    } else {
+      const baseZod = zodForType(base, node, ctx);
+      const literals = node.enum
+        .filter((v) => v !== null)
+        .map((v) => z.literal(v as Parameters<typeof z.literal>[0]));
+      mapped = literals.length > 0 ? zodUnion([...literals, baseZod]) : baseZod;
+    }
     const nullable = nodeIsNullable(node) || node.enum.includes(null);
     return nullable ? mapped.nullable() : mapped;
   }

@@ -180,16 +180,21 @@ describe('e2e: proxied tool advertises real types and forwards them intact', () 
 
     const { client } = await linkedPair(bundler);
 
-    // (a) the $ref/anyOf field is advertised with a real TYPE (string|null),
-    // not the old typeless `{}` — so the model knows it's a string, not junk.
+    // (a) the field is advertised with the enum VALUES as hints (model sees
+    // llm/mcp) AND a general string branch (other strings allowed), plus null —
+    // not the old typeless `{}`. This is the "middle path": advertise the known
+    // values without enforcing membership.
     const { tools } = await client.listTools();
     const mode = (
       tools.find((t) => t.name === 'local__proxy_update')?.inputSchema
         ?.properties as Record<string, unknown> | undefined
     )?.mode;
-    expect(JSON.stringify(mode)).toContain('string');
-    expect(JSON.stringify(mode)).toContain('null'); // nullable via anyOf
-    expect(JSON.stringify(mode)).not.toBe('{}'); // not typeless
+    const modeJson = JSON.stringify(mode);
+    expect(modeJson).toContain('llm'); // enum values surfaced to the model
+    expect(modeJson).toContain('mcp');
+    expect(modeJson).toContain('string'); // general branch: other strings allowed
+    expect(modeJson).toContain('null'); // nullable via anyOf
+    expect(modeJson).not.toBe('{}'); // not typeless
 
     // (b) a member forwards; (c) so does a NON-member string (serde-alias-safe:
     // membership is NOT enforced at the proxy, only the type). A wrong TYPE is
